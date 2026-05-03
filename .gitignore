@@ -1,0 +1,14 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+jobs/
+logs/
+.env
+.env.*
+!.env.example
+
+# Eval data lives in the private HF dataset orinlabs/horizon-1-eval-traces.
+# Pull with: uv run --with huggingface_hub python scripts/fetch_eval_data.py
+evals/*/environment/workdir/trace.jsonl
+evals/*/data/*.raw.jsonl

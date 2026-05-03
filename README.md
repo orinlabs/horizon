@@ -1,11 +1,11 @@
-# Horizon-1
+# Horizon-1 Sample Set
 
-![Horizon-1](docs/benchmark.png)
+Horizon-1
 
-[![Stars](https://img.shields.io/github/stars/orinlabs/horizon-1?style=flat&logo=github)](https://github.com/orinlabs/horizon-1/stargazers)
-[![Last commit](https://img.shields.io/github/last-commit/orinlabs/horizon-1)](https://github.com/orinlabs/horizon-1/commits/main)
-[![License](https://img.shields.io/github/license/orinlabs/horizon-1)](./LICENSE)
-[![Harbor](https://img.shields.io/badge/harness-harbor-blue)](https://www.harborframework.com/)
+[Stars](https://github.com/orinlabs/horizon-1/stargazers)  
+[Last commit](https://github.com/orinlabs/horizon-1/commits/main)  
+[License](./LICENSE)  
+[Harbor](https://www.harborframework.com/)
 
 A continual learning benchmark for extremely long-horizon agents, packaged as [Harbor](https://www.harborframework.com/) tasks and agents.
 
@@ -15,125 +15,55 @@ As agents get more autonomous, their ability to learn continuously has become a 
 
 Horizon-1 measures whether an agent can acquire learnings from a long first-person history and apply them later in a stateful environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
 
-## Anatomy of an Eval
+## Installation
 
-Every Horizon-1 eval is a `(trace, environment)` pair. The agent ingests a long first-person history (the **trace**), then takes live actions in the **environment** to finish whatever work is still pending. A verifier scores the final state.
-
-### Trace
-
-The trace is an append-only JSONL log of timestamped events: messages, reasoning, tool calls, and tool outputs. Example traces are synthetic and hosted in the public Hugging Face dataset [`orinlabs/horizon-1-example-traces`](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
-
-At eval start, the Horizon environment subclass downloads `<eval-slug>/trace.jsonl` from Hugging Face and stages it at `/workdir/trace.jsonl`. Agents can read or index that file before it is removed by retrieval-style baselines.
-
-### Environment-Owned Tools
-
-The environment defines the tool surface in `/tools/tools.json`. Agents load this registry and pass the schemas directly to the LLM SDK. Tool calls are routed back through handlers defined by the registry, which mutate environment state under `/state`.
-
-Agents should not invent generic tools for registry-based evals. In particular, API agents should not expose a generic bash tool unless the environment explicitly defines one in `/tools/tools.json`.
-
-The example evals publish a small inbox API: `inbox_list`, `inbox_read`, and `reply_send`. The handler backend edits local JSON state; the verifier checks that state after the run.
-
-### Scoring
-
-After `run` returns, Harbor executes the task's `tests/test.sh` inside the container. The script writes either `/logs/verifier/reward.txt` (`1` for pass, `0` for fail) or a richer `/logs/verifier/reward.json`.
-
-The example evals use deterministic Python judges. Each one checks that the agent replied to the right thread with details that are only available in the prior trace, while avoiding distractor details from the current inbox.
-
-## Getting Started
-
-Install Harbor:
+Requires [Docker](https://docs.docker.com/get-docker/) and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/orinlabs/horizon-1.git
 cd horizon-1
-uv tool install harbor
+uv tool install harbor --with-editable .
 ```
 
-Configure secrets:
+`--with-editable .` installs this repo's reference agents (e.g. `trace_shell_context`) alongside Harbor so they can be referenced by import path.
+
+## Running the benchmark
+
+Get an [OpenRouter](https://openrouter.ai/keys) API key, then run the full dataset against any agent:
 
 ```bash
-cp .env.example .env
+# built-in Harbor agent (e.g. terminus-2)
+harbor run \
+  -d orinlabs/horizon-1-public \
+  -a terminus-2 \
+  -m openrouter/openai/gpt-4o-mini \
+  --ae OPENROUTER_API_KEY=sk-or-...
+
+# reference agent shipped in this repo
+harbor run \
+  -d orinlabs/horizon-1-public \
+  --agent-import-path trace_shell_context.agent:TraceShellContextAgent \
+  -m openai/gpt-4o-mini \
+  --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
-Then edit `.env`:
+`-d` runs every task in the [`orinlabs/horizon-1-public`](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public) dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
+
+Reference agents live under `agents/`. Any [Harbor built-in agent](https://www.harborframework.com/docs/agents) works with `-a <name>`. Results land in `jobs/<job-name>/` — browse them with `harbor view jobs`.
+
+## Running on Daytona
+
+Trials run on local Docker by default, one at a time. For parallel cloud runs, get a [Daytona](https://www.daytona.io/) API key and pass `-e daytona`:
 
 ```bash
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
+export DAYTONA_API_KEY=dtn_...
+
+harbor run \
+  -d orinlabs/horizon-1-public \
+  -a terminus-2 \
+  -m openrouter/openai/gpt-4o-mini \
+  -e daytona \
+  -n 32 \
+  --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
-Example traces are public, so no Hugging Face token is needed. Run an example
-with the Horizon Docker environment, which hydrates `/workdir/trace.jsonl`
-before the agent starts:
-
-```bash
-source .env && export OPENROUTER_API_KEY
-PYTHONPATH=agents harbor run \
-    --environment-import-path horizon_environment:HorizonDockerEnvironment \
-    -p evals/01-example-catering-vendor \
-    --agent-import-path trace_keyword.agent:TraceKeywordAgent \
-    -m openai/gpt-4o-mini \
-    -y
-```
-
-To run on Modal instead, use the Modal environment subclass:
-
-```bash
-source .env && export OPENROUTER_API_KEY
-PYTHONPATH=agents harbor run \
-    --environment-import-path horizon_environment:HorizonModalEnvironment \
-    -p evals/01-example-catering-vendor \
-    --agent-import-path trace_keyword.agent:TraceKeywordAgent \
-    -m openai/gpt-4o-mini \
-    -y
-```
-
-You can also fetch traces locally for inspection:
-
-```bash
-uv run --with huggingface_hub python scripts/fetch_eval_data.py
-```
-
-Run oracle and nop checks:
-
-```bash
-PYTHONPATH=agents harbor run \
-    --environment-import-path horizon_environment:HorizonDockerEnvironment \
-    -p evals/01-example-catering-vendor -a oracle -y
-PYTHONPATH=agents harbor run \
-    --environment-import-path horizon_environment:HorizonDockerEnvironment \
-    -p evals/01-example-catering-vendor -a nop -y
-```
-
-Included examples:
-
-- `01-example-catering-vendor`: recover the selected event vendor and a supporting quote detail.
-- `02-example-expense-code`: recover a travel reimbursement project code and receipt requirement.
-- `03-example-reading-preference`: recover a reading-group paper preference and note format.
-
-Every run writes per-trial trajectories, verifier logs, and artifacts under `jobs/<timestamp>/`.
-
-## Included Agents
-
-- [`trace_window`](agents/trace_window/) - reads a bounded trace window, then uses environment-owned tools from `/tools/tools.json`.
-- [`trace_keyword`](agents/trace_keyword/) - chunks the trace by day, exposes a BM25 `trace_search` tool, and combines it with environment-owned tools.
-- [`trace_rag`](agents/trace_rag/) - chunks the trace by day, exposes an embedding-backed `trace_search` tool, and combines it with environment-owned tools.
-
-## Writing Registry-Based Agents
-
-A registry-based API agent should:
-
-1. Read or index `/workdir/trace.jsonl`.
-2. Load `/tools/tools.json`.
-3. Pass the registry's `sdk_schema` entries directly to the LLM SDK.
-4. Route model tool calls through the registry handler definitions.
-5. Emit ATIF trajectory data if possible.
-
-See [`agents/environment_tools.py`](agents/environment_tools.py) and [`agents/trace_keyword/agent.py`](agents/trace_keyword/agent.py) for a minimal retrieval implementation.
-
-## Inspect Results
-
-Harbor ships a browser UI for trial trajectories and verifier output:
-
-```bash
-harbor view jobs
-```

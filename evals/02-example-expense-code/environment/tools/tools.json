@@ -21,7 +21,7 @@
       },
       "handler": {
         "type": "command",
-        "argv": ["python", "/app/tool_handler.py", "inbox_list"],
+        "argv": ["inbox_list"],
         "arg_map": {"reasoning": "--reasoning", "limit": "--limit"}
       }
     },
@@ -45,7 +45,7 @@
       },
       "handler": {
         "type": "command",
-        "argv": ["python", "/app/tool_handler.py", "inbox_read"],
+        "argv": ["inbox_read"],
         "arg_map": {"reasoning": "--reasoning", "thread_id": "--thread-id"}
       }
     },
@@ -70,7 +70,7 @@
       },
       "handler": {
         "type": "command",
-        "argv": ["python", "/app/tool_handler.py", "reply_send"],
+        "argv": ["reply_send"],
         "arg_map": {"reasoning": "--reasoning", "thread_id": "--thread-id", "body": "--body"}
       }
     }

@@ -1,12 +1,7 @@
-FROM python:3.12-slim
+FROM ghcr.io/orinlabs/horizon-1-environment:latest
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash \
-    && rm -rf /var/lib/apt/lists/*
+ARG HORIZON_EVAL_SLUG=02-example-expense-code
 
-WORKDIR /app
+COPY tools/ /.horizon/tools/
 
-COPY app/ /app/
-COPY tools/ /tools/
-
-RUN mkdir -p /workdir /state /logs/verifier /logs/agent
+RUN horizon-download-trace "$HORIZON_EVAL_SLUG" && horizon-install-tools

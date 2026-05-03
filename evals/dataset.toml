@@ -1,0 +1,22 @@
+# Dataset manifest for orinlabs/horizon-1-public
+# Add tasks using: harbor add <org>/<name>
+# Publish using: harbor publish
+
+[dataset]
+name = "orinlabs/horizon-1-public"
+description = "Horizon-1 sample set: continual-learning eval tasks"
+authors = []
+keywords = []
+
+[[tasks]]
+name = "orinlabs/01-example-catering-vendor"
+digest = "sha256:b692c3d505d463f76a74ebd69965596e3275332c67c2025b250c562efc9a23a5"
+
+[[tasks]]
+name = "orinlabs/02-example-expense-code"
+digest = "sha256:bdad4a57eed80c2ebf9734e8d5e85ef23176bdc5c850b93316b5ea274f1cd6b7"
+
+[[tasks]]
+name = "orinlabs/03-example-reading-preference"
+digest = "sha256:bca4fb9783c66702ad4e6338be87d79152e22534ee06673f549cfded16d94f09"
+

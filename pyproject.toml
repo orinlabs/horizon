@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "horizon-1-agents"
+version = "0.1.0"
+description = "Horizon-1 reference agents for use with the Harbor benchmark."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "harbor[daytona]>=0.6.4",
+    "openai>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agents/trace_shell_context"]
+
+[tool.hatch.build.targets.wheel.sources]
+"agents" = ""

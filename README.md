@@ -2,9 +2,9 @@
 
 ![Horizon-1](docs/benchmark.png)
 
-[![Stars](https://img.shields.io/github/stars/orinlabs/horizon-1?style=flat&logo=github)](https://github.com/orinlabs/horizon-1/stargazers)
-[![Last commit](https://img.shields.io/github/last-commit/orinlabs/horizon-1)](https://github.com/orinlabs/horizon-1/commits/main)
-[![License](https://img.shields.io/github/license/orinlabs/horizon-1)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/orinlabs/horizon-1?style=flat&logo=github&cacheSeconds=300)](https://github.com/orinlabs/horizon-1/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/orinlabs/horizon-1?cacheSeconds=300)](https://github.com/orinlabs/horizon-1/commits/main)
+[![License](https://img.shields.io/github/license/orinlabs/horizon-1?cacheSeconds=300)](./LICENSE)
 [![Harbor](https://img.shields.io/badge/harness-harbor-blue)](https://www.harborframework.com/)
 
 A continual learning benchmark for extremely long-horizon agents, packaged as [Harbor](https://www.harborframework.com/) tasks and agents.

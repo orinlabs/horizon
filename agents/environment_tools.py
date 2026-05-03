@@ -11,7 +11,7 @@ Agents should treat this module as generic plumbing:
 - pass the advertised ``sdk_schema`` entries directly to the LLM SDK
 - route model tool calls back through the declared handlers
 
-This module intentionally has no Acadia-specific logic.
+This module intentionally has no application-specific logic.
 """
 
 from __future__ import annotations

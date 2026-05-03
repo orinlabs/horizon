@@ -27,7 +27,8 @@ Run it with::
 
     source .env && export OPENROUTER_API_KEY
     PYTHONPATH=agents harbor run \\
-        -p evals/therapy-goals-followthrough \\
+        --environment-import-path horizon_environment:HorizonDockerEnvironment \\
+        -p evals/01-example-catering-vendor \\
         --agent-import-path trace_rag.agent:TraceRagAgent \\
         -m openai/gpt-4o-mini
 """

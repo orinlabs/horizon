@@ -3,9 +3,9 @@
 Keeps only the last ``WINDOW_SIZE`` events of ``/workdir/trace.jsonl`` and
 stuffs that compact slice into the user prompt. No retrieval, no
 summarization, no memory store — a true floor for "what if the harness
-just keeps recent context and discards everything else?". If the more
-sophisticated agents (``trace_dump``, ``trace_rag``, ``hermes``) don't
-beat this on a given eval, the extra ingestion isn't earning its keep.
+just keeps recent context and discards everything else?". If the retrieval
+agents do not beat this on a given eval, the extra ingestion is not earning
+its keep.
 
 Tool ownership matches the other harnesses: the environment publishes
 ``/tools/tools.json`` and this agent passes those schemas straight to the

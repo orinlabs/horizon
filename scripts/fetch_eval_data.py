@@ -1,4 +1,4 @@
-"""Fetch eval ``trace.jsonl`` files from the private HF dataset.
+"""Fetch eval ``trace.jsonl`` files from the Hugging Face dataset.
 
 Each eval container is built from ``evals/<slug>/environment/`` and the
 Dockerfile copies ``workdir/`` into ``/workdir/``. The trace input lives at
@@ -6,7 +6,7 @@ Dockerfile copies ``workdir/`` into ``/workdir/``. The trace input lives at
 into that exact path so ``harbor run`` (and any plain ``docker build``)
 picks it up unchanged.
 
-Source dataset: ``orinlabs/horizon-1-eval-traces`` (private)
+Source dataset: ``orinlabs/horizon-1-example-traces``
 
 Layout on HF:
     <slug>/trace.jsonl              <- what this script fetches
@@ -14,17 +14,13 @@ Layout on HF:
                                        evals/<slug>/scripts/build_trace.py;
                                        opt in with --raw
 
-Auth:
-    Set ``HF_TOKEN`` (or run ``huggingface-cli login``) with read access to
-    the private dataset.
-
 Examples:
     # All evals (trace only — typical case before harbor run)
     uv run --with huggingface_hub python scripts/fetch_eval_data.py
 
     # One eval
     uv run --with huggingface_hub python scripts/fetch_eval_data.py \\
-        01-direct-semantic-holiday-party-caterer
+        01-example-catering-vendor
 
     # Also pull raw inputs (only needed to re-run build_trace.py)
     uv run --with huggingface_hub python scripts/fetch_eval_data.py --raw
@@ -36,11 +32,10 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
-REPO_ID = "orinlabs/horizon-1-eval-traces"
+REPO_ID = "orinlabs/horizon-1-example-traces"
 REPO_TYPE = "dataset"
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,17 +129,6 @@ def main() -> int:
         help="Re-download even if the target file already exists",
     )
     args = parser.parse_args()
-
-    if not (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or (Path.home() / ".cache/huggingface/token").exists()
-    ):
-        print(
-            "warning: no HF token found (HF_TOKEN / huggingface-cli login). "
-            "Private dataset access will fail.",
-            file=sys.stderr,
-        )
 
     from huggingface_hub import HfApi
 

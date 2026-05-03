@@ -4,24 +4,22 @@
 # on Modal — independent processes run concurrently fine.
 #
 # Usage:
-#   source .env && export HF_TOKEN OPENROUTER_API_KEY
-#   scripts/bench_parallel.sh evals/01-direct-semantic-holiday-party-caterer
+#   source .env && export OPENROUTER_API_KEY
+#   scripts/bench_parallel.sh evals/01-example-catering-vendor
 set -euo pipefail
 
-EVAL_PATH="${1:-evals/01-direct-semantic-holiday-party-caterer}"
+EVAL_PATH="${1:-evals/01-example-catering-vendor}"
 EVAL_SLUG=$(basename "$EVAL_PATH")
 JOB_PREFIX="${JOB_PREFIX:-bench-$(date +%H%M%S)}"
 ENV_PATH="${ENV_PATH:-horizon_environment:HorizonModalEnvironment}"
 
 # (agent_name, import_path, model)
 AGENTS=(
-  "trace_dump|trace_dump.agent:TraceDumpAgent|google/gemini-2.5-flash"
   "trace_window|trace_window.agent:TraceWindowAgent|google/gemini-2.5-flash"
   "trace_summary|trace_summary.agent:TraceSummaryAgent|google/gemini-2.5-flash"
   "trace_keyword|trace_keyword.agent:TraceKeywordAgent|google/gemini-2.5-flash"
   "trace_rag|trace_rag.agent:TraceRagAgent|google/gemini-2.5-flash"
   "trace_mem0|trace_mem0.agent:TraceMem0Agent|google/gemini-2.5-flash"
-  "hermes|hermes.agent:HermesAgent|anthropic/claude-sonnet-4.6"
 )
 
 mkdir -p logs/bench

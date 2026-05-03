@@ -4,16 +4,9 @@ RAG baseline over `/workdir/trace.jsonl`. Chunks the trace by UTC day, embeds ea
 
 The task environment must publish `/tools/tools.json`; `trace_rag` combines the agent-owned `trace_search` tool with those environment-owned tools. It does not provide a generic bash tool.
 
-## How it differs from `trace_dump`
+## How it differs from prompt stuffing
 
-| | `trace_dump` | `trace_rag` |
-|---|---|---|
-| Trace in system prompt? | Yes (entire file) | No |
-| Extra tool | — | `trace_search(query, k=3)` |
-| API calls for ingest | 0 | 1 batch embedding of N day-chunks |
-| Token cost scales with | Trace size × every LLM turn | Query size × search calls |
-
-On a 2-message trace `trace_dump` is cheaper. On a multi-week real trace, RAG wins by orders of magnitude.
+`trace_rag` does not put the full trace in the system prompt. It embeds day chunks once at ingest, exposes `trace_search(query, k=3)`, and keeps later chat turns focused on retrieved chunks rather than the entire trace.
 
 ## Requirements
 
@@ -24,7 +17,8 @@ On a 2-message trace `trace_dump` is cheaper. On a multi-week real trace, RAG wi
 ```bash
 source .env && export OPENROUTER_API_KEY
 PYTHONPATH=agents harbor run \
-    -p evals/therapy-goals-followthrough \
+    --environment-import-path horizon_environment:HorizonDockerEnvironment \
+    -p evals/01-example-catering-vendor \
     --agent-import-path trace_rag.agent:TraceRagAgent \
     -m openai/gpt-4o-mini
 ```

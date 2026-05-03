@@ -6,7 +6,7 @@ LLM-summarize each older bucket into prose, keep the most recent
 ``[summaries…] + [recent raw events]`` into the user prompt. No retrieval
 tool, no embeddings — just compression.
 
-This compresses a trace that ``trace_dump`` would otherwise blow context on,
+This compresses traces that would otherwise be too large to prompt directly,
 without the embedding cost of ``trace_rag``. A useful comparator for
 "is RAG worth it vs. plain summarization?"
 """

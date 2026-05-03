@@ -1,0 +1,78 @@
+{
+  "schema_version": "horizon-tools-v1",
+  "tools": [
+    {
+      "name": "inbox_list",
+      "sdk_schema": {
+        "type": "function",
+        "function": {
+          "name": "inbox_list",
+          "description": "List current inbox threads that may require action.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reasoning": {"type": "string", "description": "Why you are checking the inbox."},
+              "limit": {"type": "integer", "description": "Maximum number of threads to return.", "default": 10}
+            },
+            "required": ["reasoning"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "handler": {
+        "type": "command",
+        "argv": ["python", "/app/tool_handler.py", "inbox_list"],
+        "arg_map": {"reasoning": "--reasoning", "limit": "--limit"}
+      }
+    },
+    {
+      "name": "inbox_read",
+      "sdk_schema": {
+        "type": "function",
+        "function": {
+          "name": "inbox_read",
+          "description": "Read the full message history for an inbox thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reasoning": {"type": "string", "description": "Why you are reading this thread."},
+              "thread_id": {"type": "string", "description": "The thread id to read."}
+            },
+            "required": ["reasoning", "thread_id"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "handler": {
+        "type": "command",
+        "argv": ["python", "/app/tool_handler.py", "inbox_read"],
+        "arg_map": {"reasoning": "--reasoning", "thread_id": "--thread-id"}
+      }
+    },
+    {
+      "name": "reply_send",
+      "sdk_schema": {
+        "type": "function",
+        "function": {
+          "name": "reply_send",
+          "description": "Send a reply in an existing inbox thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reasoning": {"type": "string", "description": "Why this reply should be sent."},
+              "thread_id": {"type": "string", "description": "The thread id to reply to."},
+              "body": {"type": "string", "description": "The reply body."}
+            },
+            "required": ["reasoning", "thread_id", "body"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "handler": {
+        "type": "command",
+        "argv": ["python", "/app/tool_handler.py", "reply_send"],
+        "arg_map": {"reasoning": "--reasoning", "thread_id": "--thread-id", "body": "--body"}
+      }
+    }
+  ]
+}

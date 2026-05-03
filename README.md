@@ -15,6 +15,8 @@ As agents get more autonomous, their ability to learn continuously has become a 
 
 Horizon-1 measures whether an agent can acquire learnings from a long first-person history and apply them later in a stateful environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
 
+Per-task prior-session traces (the long first-person history each task starts with) live in the public Hugging Face dataset [`orinlabs/horizon-1-example-traces`](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces) and are pulled into each eval's environment image at build time.
+
 ## Installation
 
 Requires [Docker](https://docs.docker.com/get-docker/) and [uv](https://docs.astral.sh/uv/).

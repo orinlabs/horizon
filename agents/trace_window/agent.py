@@ -24,7 +24,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_utils import cost_note, read_trace_file, trial_subkey, usage_cost
+from agent_utils import read_trace_file, trial_subkey, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -372,12 +372,7 @@ class TraceWindowAgent(BaseAgent):
                     "chat": round(t_end - t_ingest_done, 3),
                     "total": round(t_end - t_start, 3),
                 },
-                "cost_usd": {
-                    "total": tk.usage_usd,
-                    "chat_direct": round(chat_cost_usd, 6),
-                    "mode": tk.mode,
-                    "_note": cost_note(tk.mode),
-                },
+                "cost_usd": tk.cost_usd_dict(direct_total=chat_cost_usd),
             },
         )
         (self.logs_dir / "trajectory.json").write_text(

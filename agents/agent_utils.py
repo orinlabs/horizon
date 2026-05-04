@@ -18,7 +18,7 @@ import time
 from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from harbor.environments.base import BaseEnvironment
 
@@ -471,32 +471,88 @@ def summarize_call_log(call_log: list[dict]) -> dict[str, Any]:
 
 OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
+TrialKeyMode = Literal[
+    "isolated_subkey",
+    "isolated_subkey_query_failed",
+    "isolated_subkey_provision_failed",
+    "shared_key",
+]
+
+_COST_NOTES: dict[TrialKeyMode, str] = {
+    "isolated_subkey": (
+        "Total = cumulative USD on a per-trial OpenRouter sub-key. "
+        "Captures every call billed to the sub-key (agent direct calls, "
+        "sub-library internals, subprocess CLIs). Sub-key is created at "
+        "trial start and deleted at trial end."
+    ),
+    "isolated_subkey_query_failed": (
+        "Sub-key was minted but post-trial usage query failed; sub-key "
+        "deleted (best-effort). No cost data available."
+    ),
+    "isolated_subkey_provision_failed": (
+        "OPENROUTER_PROVISIONING_KEY was set but the sub-key mint call "
+        "failed (transient API error, expired/invalid provisioning "
+        "credential, or network issue). Trial fell back to the shared "
+        "OPENROUTER_API_KEY; per-trial cost cannot be isolated."
+    ),
+    "shared_key": (
+        "OPENROUTER_PROVISIONING_KEY not set; trial used the shared "
+        "OPENROUTER_API_KEY. Per-trial cost cannot be isolated from "
+        "concurrent traffic. Set OPENROUTER_PROVISIONING_KEY for exact "
+        "per-trial USD."
+    ),
+}
+
 
 @dataclass
 class TrialKeyState:
-    """Mutable state passed through :func:`trial_subkey`.
+    """Per-trial OpenRouter key handle with mode + post-exit usage stats.
 
-    Read ``usage_usd`` and ``mode`` AFTER the ``async with`` block exits.
+    Created by :func:`begin_trial_key`, finalized by
+    :func:`finalize_trial_key`. ``usage_usd`` is populated only after
+    finalize runs.
     """
 
-    key: str  # use this for LLM calls (host or sandbox)
-    mode: str  # "isolated_subkey" | "shared_key" | "isolated_subkey_query_failed"
-    hash: str | None = None
+    key: str
+    mode: TrialKeyMode
+    _hash: str | None = None
     usage_usd: float | None = None
 
+    @property
+    def note(self) -> str:
+        """Stable user-facing note for ``trajectory.extra.cost_usd._note``."""
+        return _COST_NOTES.get(self.mode, "")
 
-async def provision_subkey(
-    provisioning_key: str,
-    *,
-    label: str,
-    limit_usd: float | None = OPENROUTER_TRIAL_LIMIT_USD,
+    def cost_usd_dict(
+        self,
+        *,
+        direct_total: float | None = None,
+        breakdown: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Canonical ``trajectory.extra.cost_usd`` shape.
+
+        ``direct_total`` is the sum of USD metered via ``usage_cost(resp)``
+        on the agent's own direct OpenRouter calls — informational only.
+        ``total`` (from the sub-key) remains authoritative. ``breakdown``
+        carries per-phase splits (e.g. trace_rag's ingest/chat/query, or
+        trace_summary's chat/summary).
+        """
+        out: dict[str, Any] = {
+            "total": self.usage_usd,
+            "mode": self.mode,
+            "_note": self.note,
+        }
+        if direct_total is not None:
+            out["direct_total"] = round(direct_total, 6)
+        if breakdown is not None:
+            out["_breakdown"] = breakdown
+        return out
+
+
+async def _post_subkey(
+    provisioning_key: str, *, label: str, limit_usd: float | None
 ) -> dict[str, str]:
-    """Mint a disposable OpenRouter API key. Returns ``{"key": str, "hash": str}``.
-
-    ``label`` is a human-readable name (visible in the OpenRouter dashboard).
-    ``limit_usd`` caps total spend on this child key — runaway protection.
-    Caller MUST call :func:`delete_subkey` when done.
-    """
+    """Mint a disposable OpenRouter child key. Caller owns deletion."""
     import httpx
 
     body: dict[str, Any] = {"name": label}
@@ -514,8 +570,8 @@ async def provision_subkey(
     return {"key": payload["key"], "hash": data["hash"]}
 
 
-async def subkey_usage(provisioning_key: str, key_hash: str) -> float:
-    """Return cumulative USD spent on a child key (queried via its hash)."""
+async def _get_subkey_usage(provisioning_key: str, key_hash: str) -> float:
+    """Return cumulative USD spent on a child key."""
     import httpx
 
     headers = {"Authorization": f"Bearer {provisioning_key}"}
@@ -528,8 +584,8 @@ async def subkey_usage(provisioning_key: str, key_hash: str) -> float:
     return float(data.get("usage", 0.0))
 
 
-async def delete_subkey(provisioning_key: str, key_hash: str) -> bool:
-    """Best-effort delete. Returns True on 2xx, False otherwise. Idempotent."""
+async def _delete_subkey(provisioning_key: str, key_hash: str) -> bool:
+    """Best-effort delete. Returns True on 2xx, False otherwise."""
     import httpx
 
     headers = {"Authorization": f"Bearer {provisioning_key}"}
@@ -542,35 +598,72 @@ async def delete_subkey(provisioning_key: str, key_hash: str) -> bool:
         return False
 
 
-def cost_note(mode: str) -> str:
-    """Stable user-facing note for ``trajectory.extra.cost_usd._note``."""
-    if mode == "isolated_subkey":
-        return (
-            "Total = cumulative USD on a per-trial OpenRouter sub-key. "
-            "Captures every call billed to the sub-key (agent direct calls, "
-            "sub-library internals, subprocess CLIs). Sub-key is created at "
-            "trial start and deleted at trial end."
+async def begin_trial_key(
+    *,
+    provisioning_key: str | None,
+    fallback_key: str,
+    label: str,
+    limit_usd: float | None = OPENROUTER_TRIAL_LIMIT_USD,
+) -> TrialKeyState:
+    """Mint a per-trial sub-key, or fall back to ``fallback_key``.
+
+    Pair with :func:`finalize_trial_key` to snapshot usage + delete on
+    trial exit. For run-only agents, prefer :func:`trial_subkey` (a thin
+    async-context-manager wrapping this pair); use begin/finalize directly
+    only when the trial spans multiple methods (install + run +
+    populate_context_post_run on installed agents).
+    """
+    if not provisioning_key:
+        return TrialKeyState(key=fallback_key, mode="shared_key")
+    try:
+        minted = await _post_subkey(
+            provisioning_key, label=label, limit_usd=limit_usd
         )
-    if mode == "isolated_subkey_query_failed":
-        return (
-            "Sub-key was minted but post-trial usage query failed; sub-key "
-            "deleted (best-effort). No cost data available."
+    except Exception:
+        return TrialKeyState(
+            key=fallback_key, mode="isolated_subkey_provision_failed"
         )
-    if mode == "isolated_subkey_provision_failed":
-        return (
-            "OPENROUTER_PROVISIONING_KEY was set but the sub-key mint call "
-            "failed (transient API error, expired/invalid provisioning "
-            "credential, or network issue). Trial fell back to the shared "
-            "OPENROUTER_API_KEY; per-trial cost cannot be isolated."
-        )
-    if mode == "shared_key":
-        return (
-            "OPENROUTER_PROVISIONING_KEY not set; trial used the shared "
-            "OPENROUTER_API_KEY. Per-trial cost cannot be isolated from "
-            "concurrent traffic. Set OPENROUTER_PROVISIONING_KEY for exact "
-            "per-trial USD."
-        )
-    return ""
+    return TrialKeyState(
+        key=minted["key"], mode="isolated_subkey", _hash=minted["hash"]
+    )
+
+
+async def finalize_trial_key(
+    state: TrialKeyState,
+    *,
+    provisioning_key: str | None,
+    settle_seconds: float = 5.0,
+    overlap: Iterable[Any] = (),
+) -> None:
+    """Snapshot usage + delete the sub-key. No-op for non-isolated modes.
+
+    ``overlap`` is an optional iterable of awaitables to run *concurrently
+    with the activity-ledger settle delay* — sandbox-side cleanup reads
+    that take a few seconds anyway can hide behind the settle for free.
+    Awaitable exceptions are swallowed (these are best-effort cleanup
+    calls).
+    """
+    if state.mode != "isolated_subkey" or not provisioning_key or not state._hash:
+        # Still drain `overlap` even if we're not snapshotting the sub-key,
+        # so callers can use it as a generic "run these in parallel with the
+        # cleanup phase" hook regardless of mode.
+        if overlap:
+            await asyncio.gather(*overlap, return_exceptions=True)
+        return
+
+    settle = asyncio.sleep(settle_seconds) if settle_seconds > 0 else _no_op()
+    await asyncio.gather(settle, *overlap, return_exceptions=True)
+
+    try:
+        state.usage_usd = await _get_subkey_usage(provisioning_key, state._hash)
+    except Exception:
+        state.usage_usd = None
+        state.mode = "isolated_subkey_query_failed"
+    await _delete_subkey(provisioning_key, state._hash)
+
+
+async def _no_op() -> None:
+    return None
 
 
 @asynccontextmanager
@@ -582,62 +675,24 @@ async def trial_subkey(
     limit_usd: float | None = OPENROUTER_TRIAL_LIMIT_USD,
     settle_seconds: float = 5.0,
 ):
-    """Yield a :class:`TrialKeyState`. Mutates ``usage_usd`` + ``mode`` after exit.
+    """Yield a :class:`TrialKeyState` for the duration of a run-only trial.
 
-    If ``provisioning_key`` is set: mints a sub-key for the trial, hands it
-    to the caller as ``state.key``, snapshots usage on exit, deletes the
-    sub-key. ``state.usage_usd`` will be the exact USD spent through that
-    sub-key (covering everything billed to it — agent direct calls,
-    sub-libraries, subprocess CLIs).
-
-    If ``provisioning_key`` is None: falls back to ``fallback_key``.
-    ``usage_usd`` stays None (no per-trial attribution available on a
-    shared key).
-
-    ``settle_seconds`` accounts for OpenRouter's activity pipeline lag (a
-    few seconds between completion and ledger update). 5s is conservative
-    but reliable.
+    Mutates ``state.usage_usd`` and ``state.mode`` after exit, callers
+    read them as ``trajectory.extra.cost_usd``. For installed agents
+    where the trial spans install + run + post_run, use
+    :func:`begin_trial_key` / :func:`finalize_trial_key` directly.
     """
-    if not provisioning_key:
-        state = TrialKeyState(key=fallback_key, mode="shared_key")
-        yield state
-        return
-
-    try:
-        minted = await provision_subkey(
-            provisioning_key, label=label, limit_usd=limit_usd
-        )
-    except Exception:
-        # Provisioning was attempted but failed (transient API error,
-        # bad provisioning credential, etc.). Fall back to the shared
-        # key so the trial can still run, but flag the mode distinctly
-        # so reviewers can tell this apart from "user never set
-        # OPENROUTER_PROVISIONING_KEY in the first place" — silent
-        # equivalence between those two cases makes sweep-wide sub-key
-        # outages invisible.
-        state = TrialKeyState(
-            key=fallback_key, mode="isolated_subkey_provision_failed"
-        )
-        yield state
-        return
-
-    state = TrialKeyState(
-        key=minted["key"],
-        mode="isolated_subkey",
-        hash=minted["hash"],
+    state = await begin_trial_key(
+        provisioning_key=provisioning_key,
+        fallback_key=fallback_key,
+        label=label,
+        limit_usd=limit_usd,
     )
     try:
         yield state
     finally:
-        if settle_seconds > 0:
-            try:
-                await asyncio.sleep(settle_seconds)
-            except Exception:
-                pass
-        try:
-            state.usage_usd = await subkey_usage(provisioning_key, state.hash or "")
-        except Exception:
-            state.usage_usd = None
-            state.mode = "isolated_subkey_query_failed"
-        if state.hash:
-            await delete_subkey(provisioning_key, state.hash)
+        await finalize_trial_key(
+            state,
+            provisioning_key=provisioning_key,
+            settle_seconds=settle_seconds,
+        )

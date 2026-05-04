@@ -56,7 +56,6 @@ import numpy as np
 
 from agent_utils import (
     HorizonToolRegistry,
-    cost_note,
     load_environment_tools,
     read_trace_file,
     summarize_call_log,
@@ -586,17 +585,14 @@ class TraceRagAgent(BaseAgent):
                     "chat": round(t_end - t_ingest_done, 3),
                     "total": round(t_end - t_start, 3),
                 },
-                "cost_usd": {
-                    "total": tk.usage_usd,
-                    "direct_total": round(direct_total, 6),
-                    "mode": tk.mode,
-                    "_note": cost_note(tk.mode),
-                    "_breakdown": {
+                "cost_usd": tk.cost_usd_dict(
+                    direct_total=direct_total,
+                    breakdown={
                         "ingest_embeddings": round(ingest_embedding_cost_usd, 6),
                         "chat_completions": round(chat_cost_usd, 6),
                         "query_embeddings": round(query_embedding_cost_usd, 6),
                     },
-                },
+                ),
                 "call_summary": summarize_call_log(call_log),
                 "call_log": call_log,
             },

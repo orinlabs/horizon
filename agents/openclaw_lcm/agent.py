@@ -39,12 +39,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_utils import (
-    OPENROUTER_TRIAL_LIMIT_USD,
     TrialKeyState,
-    cost_note,
-    delete_subkey,
-    provision_subkey,
-    subkey_usage,
+    begin_trial_key,
+    finalize_trial_key,
 )
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
@@ -142,42 +139,22 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
         model = self.model_name or DEFAULT_MODEL
 
-        # Mint a per-trial sub-key (or fall back to the shared key) before
-        # any LLM call. The sub-key has to span install (lcm-tui backfill
-        # summarization) AND run (openclaw agent), so we manually
-        # provision here and delete at the end of run() — the
-        # `trial_subkey` async-context-manager can't cover both phases.
-        trial_label = f"horizon-openclaw-lcm-{uuid.uuid4().hex[:8]}"
-        trial_key: TrialKeyState
-        if provisioning_key:
-            try:
-                minted = await provision_subkey(
-                    provisioning_key,
-                    label=trial_label,
-                    limit_usd=OPENROUTER_TRIAL_LIMIT_USD,
-                )
-                trial_key = TrialKeyState(
-                    key=minted["key"],
-                    mode="isolated_subkey",
-                    hash=minted["hash"],
-                )
-            except Exception:
-                # Distinguish "mint attempted but failed" from "user
-                # never set OPENROUTER_PROVISIONING_KEY" — otherwise a
-                # silently broken provisioning credential makes a whole
-                # sweep run on the shared key without any signal in the
-                # trajectory.
-                trial_key = TrialKeyState(
-                    key=fallback_key, mode="isolated_subkey_provision_failed"
-                )
-        else:
-            trial_key = TrialKeyState(key=fallback_key, mode="shared_key")
+        # Sub-key spans both install (lcm-tui backfill summarization) and
+        # run (openclaw agent), so we use begin/finalize directly rather
+        # than the `trial_subkey` context manager (which can't span two
+        # methods).
+        trial_key = await begin_trial_key(
+            provisioning_key=provisioning_key,
+            fallback_key=fallback_key,
+            label=f"horizon-openclaw-lcm-{uuid.uuid4().hex[:8]}",
+        )
         self._trial_key = trial_key
         self._trial_provisioning_key = provisioning_key
+        # Mutating _resolved_env_vars here makes every downstream
+        # consumer (lcm-tui backfill env, openclaw agent invocation in
+        # run()) see the sub-key without per-call rewrites.
+        self._resolved_env_vars["OPENROUTER_API_KEY"] = trial_key.key
         api_key = trial_key.key
-        # Make sure every downstream consumer of `self._resolved_env_vars`
-        # (including run()'s `openclaw agent` invocation) sees the sub-key.
-        self._resolved_env_vars["OPENROUTER_API_KEY"] = api_key
         self._install_started = time.monotonic()
 
         # Skip the apt + npm install if openclaw is already on PATH (warm
@@ -477,15 +454,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         )
 
         t_run_start = time.monotonic()
-        t_run_end: float | None = None
         try:
-            # Mirror the hermes capabilities preamble: the agent needs to
-            # know what surfaces are available. lossless-claw's tools
-            # (lcm_grep, lcm_describe, lcm_expand_query) are
-            # auto-registered via the plugin manifest, so the LLM sees
-            # them in its tool schema; we just make sure the agent knows
-            # the prior conversation is in scope and that horizon-tools
-            # is on PATH.
             framed = (
                 "You have two key capabilities for this task:\n"
                 "  1. LCM tools (`lcm_grep`, `lcm_describe`, `lcm_expand_query`): "
@@ -507,8 +476,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             )
 
             # --local runs openclaw embedded (no gateway daemon). Gateway
-            # mode didn't actually help lossless-claw register tools (skills
-            # injected in both, tools in neither), so we keep things simple.
+            # mode didn't actually help lossless-claw register tools.
             command = (
                 "cd /workdir && "
                 f"openclaw agent --message {shlex.quote(framed)} "
@@ -524,67 +492,22 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             )
             (self.logs_dir / "openclaw-stdout.txt").write_text(result.stdout or "")
             (self.logs_dir / "openclaw-stderr.txt").write_text(result.stderr or "")
-
-            # Snapshot lcm.db state so we can audit how much got summarized.
-            lcm_stats = await environment.exec(
-                "sqlite3 ~/.openclaw/lcm.db "
-                "\"SELECT 'conversations:'||COUNT(*) FROM conversations; "
-                "SELECT 'messages:'||COUNT(*) FROM messages; "
-                "SELECT 'summaries:'||COUNT(*) FROM summaries;\" "
-                "2>/dev/null || true",
-                user="root",
+        finally:
+            # finalize_trial_key snapshots the sub-key + deletes it
+            # AND runs the overlap awaitables (sandbox-side stats/diag
+            # captures) concurrently with the activity-ledger settle so
+            # they cost no extra wall time. The finally also covers
+            # crash paths so a mid-run exception still snapshots cost.
+            await finalize_trial_key(
+                self._trial_key,
+                provisioning_key=self._trial_provisioning_key,
+                overlap=[
+                    self._capture_lcm_stats(environment),
+                    self._capture_oc_diag(environment),
+                ],
             )
-            (self.logs_dir / "lcm-stats.txt").write_text(lcm_stats.stdout or "")
-
-            # Pull back the install-time diagnostic so we can debug plugin
-            # loading on the host (harbor's trial.log doesn't preserve the
-            # actual stdout of exec calls, just "Command outputs captured").
-            diag = await environment.exec(
-                "cat /tmp/oc-diag.txt 2>/dev/null || true", user="root"
-            )
-            (self.logs_dir / "oc-diag.txt").write_text(diag.stdout or "")
 
             t_run_end = time.monotonic()
-        finally:
-            # Cleanup must run on every exit path: a successful run, a
-            # raised subprocess error, an exec timeout, etc. Without
-            # this finally, a crash mid-run would leave the per-trial
-            # sub-key un-snapshotted (no cost_usd in the trajectory) and
-            # un-deleted (orphaned in the OpenRouter dashboard). The
-            # OPENROUTER_TRIAL_LIMIT_USD cap protects against runaway
-            # spend either way, but losing audit data is avoidable.
-            if t_run_end is None:
-                t_run_end = time.monotonic()
-
-            # Snapshot cost on the per-trial sub-key (if any) and
-            # best-effort delete it. The sub-key spanned both install
-            # (lcm-tui backfill gpt-5-mini summarization) and run
-            # (openclaw agent), so its cumulative usage is the trial's
-            # exact LLM spend.
-            trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
-            provisioning_key = getattr(self, "_trial_provisioning_key", None)
-            if (
-                trial_key is not None
-                and trial_key.mode == "isolated_subkey"
-                and provisioning_key
-            ):
-                try:
-                    # Brief settle for OpenRouter's activity ledger (a
-                    # few seconds of pipeline lag between completion +
-                    # ledger update).
-                    await asyncio.sleep(5)
-                except Exception:
-                    pass
-                try:
-                    trial_key.usage_usd = await subkey_usage(
-                        provisioning_key, trial_key.hash or ""
-                    )
-                except Exception:
-                    trial_key.usage_usd = None
-                    trial_key.mode = "isolated_subkey_query_failed"
-                if trial_key.hash:
-                    await delete_subkey(provisioning_key, trial_key.hash)
-
             install_started = getattr(self, "_install_started", t_run_start)
             install_finished = getattr(self, "_install_finished", t_run_start)
             self._trial_timings = {
@@ -592,6 +515,25 @@ class OpenClawLcmAgent(BaseInstalledAgent):
                 "chat": round(t_run_end - t_run_start, 3),
                 "total": round(t_run_end - install_started, 3),
             }
+
+    async def _capture_lcm_stats(self, environment: BaseEnvironment) -> None:
+        """Snapshot lcm.db row counts so we can audit how much got summarized."""
+        result = await environment.exec(
+            "sqlite3 ~/.openclaw/lcm.db "
+            "\"SELECT 'conversations:'||COUNT(*) FROM conversations; "
+            "SELECT 'messages:'||COUNT(*) FROM messages; "
+            "SELECT 'summaries:'||COUNT(*) FROM summaries;\" "
+            "2>/dev/null || true",
+            user="root",
+        )
+        (self.logs_dir / "lcm-stats.txt").write_text(result.stdout or "")
+
+    async def _capture_oc_diag(self, environment: BaseEnvironment) -> None:
+        """Pull the install-time diagnostic; harbor's trial.log doesn't keep stdout."""
+        result = await environment.exec(
+            "cat /tmp/oc-diag.txt 2>/dev/null || true", user="root"
+        )
+        (self.logs_dir / "oc-diag.txt").write_text(result.stdout or "")
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         stdout_path = self.logs_dir / "openclaw-stdout.txt"
@@ -645,15 +587,9 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         ]
 
         trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
-        cost_mode = trial_key.mode if trial_key is not None else "shared_key"
-        cost_total = trial_key.usage_usd if trial_key is not None else None
-        extra: dict = {
-            "cost_usd": {
-                "total": cost_total,
-                "mode": cost_mode,
-                "_note": cost_note(cost_mode),
-            },
-        }
+        if trial_key is None:
+            trial_key = TrialKeyState(key="", mode="shared_key")
+        extra: dict = {"cost_usd": trial_key.cost_usd_dict()}
         timings = getattr(self, "_trial_timings", None)
         if timings:
             extra["timing_seconds"] = timings

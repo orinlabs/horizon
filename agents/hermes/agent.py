@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from agent_utils import cost_note, trial_subkey
+from agent_utils import TrialKeyState, trial_subkey
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
     EnvVar,
@@ -388,11 +388,9 @@ class HermesAgent(BaseInstalledAgent):
 
         t_run_end = time.monotonic()
 
-        # Stash trial cost + timing so populate_context_post_run can attach
-        # them to trajectory.extra. tk.usage_usd / tk.mode are resolved
-        # post-context-exit.
-        self._trial_cost_usd = tk.usage_usd
-        self._trial_cost_mode = tk.mode
+        # Stash for populate_context_post_run; tk.usage_usd / tk.mode are
+        # already resolved by trial_subkey's finally block.
+        self._trial_key = tk
         self._trial_timings = {
             "chat": round(t_run_end - t_run_start, 3),
             "total": round(t_run_end - t_run_start, 3),
@@ -459,14 +457,10 @@ class HermesAgent(BaseInstalledAgent):
                 ),
             ]
 
-        cost_mode = getattr(self, "_trial_cost_mode", "shared_key")
-        extra: dict = {
-            "cost_usd": {
-                "total": getattr(self, "_trial_cost_usd", None),
-                "mode": cost_mode,
-                "_note": cost_note(cost_mode),
-            },
-        }
+        trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
+        if trial_key is None:
+            trial_key = TrialKeyState(key="", mode="shared_key")
+        extra: dict = {"cost_usd": trial_key.cost_usd_dict()}
         timings = getattr(self, "_trial_timings", None)
         if timings:
             extra["timing_seconds"] = timings

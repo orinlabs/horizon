@@ -436,3 +436,176 @@ def summarize_call_log(call_log: list[dict]) -> dict[str, Any]:
             "max_s": round(max(secs), 3),
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter sub-key helpers — per-trial cost isolation.
+#
+# When OPENROUTER_PROVISIONING_KEY is set, agents mint a disposable child
+# key per trial, route every LLM call through it, snapshot usage on exit,
+# and delete the child key. trajectory.extra.cost_usd.total then reflects
+# *exact* USD billed for the trial — including subprocess CLIs and
+# sub-libraries that have their own OpenAI clients (mem0, lcm-tui, hermes
+# chat, openclaw agent).
+#
+# When the provisioning key isn't set, agents fall back to the shared
+# OPENROUTER_API_KEY. Per-trial cost can't then be isolated from
+# concurrent traffic, and ``cost_usd.mode`` is set to ``"shared_key"``
+# to document the limitation.
+# ---------------------------------------------------------------------------
+
+OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
+
+
+@dataclass
+class TrialKeyState:
+    """Mutable state passed through :func:`trial_subkey`.
+
+    Read ``usage_usd`` and ``mode`` AFTER the ``async with`` block exits.
+    """
+
+    key: str  # use this for LLM calls (host or sandbox)
+    mode: str  # "isolated_subkey" | "shared_key" | "isolated_subkey_query_failed"
+    hash: str | None = None
+    usage_usd: float | None = None
+
+
+async def provision_subkey(
+    provisioning_key: str, *, label: str, limit_usd: float | None = 5.00
+) -> dict[str, str]:
+    """Mint a disposable OpenRouter API key. Returns ``{"key": str, "hash": str}``.
+
+    ``label`` is a human-readable name (visible in the OpenRouter dashboard).
+    ``limit_usd`` caps total spend on this child key — runaway protection.
+    Caller MUST call :func:`delete_subkey` when done.
+    """
+    import httpx
+
+    body: dict[str, Any] = {"name": label}
+    if limit_usd is not None:
+        body["limit"] = limit_usd
+    headers = {
+        "Authorization": f"Bearer {provisioning_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(OPENROUTER_KEYS_URL, headers=headers, json=body)
+        resp.raise_for_status()
+        payload = resp.json()
+    data = payload.get("data") or {}
+    return {"key": payload["key"], "hash": data["hash"]}
+
+
+async def subkey_usage(provisioning_key: str, key_hash: str) -> float:
+    """Return cumulative USD spent on a child key (queried via its hash)."""
+    import httpx
+
+    headers = {"Authorization": f"Bearer {provisioning_key}"}
+    url = f"{OPENROUTER_KEYS_URL}/{key_hash}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+    data = payload.get("data") or {}
+    return float(data.get("usage", 0.0))
+
+
+async def delete_subkey(provisioning_key: str, key_hash: str) -> bool:
+    """Best-effort delete. Returns True on 2xx, False otherwise. Idempotent."""
+    import httpx
+
+    headers = {"Authorization": f"Bearer {provisioning_key}"}
+    url = f"{OPENROUTER_KEYS_URL}/{key_hash}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.delete(url, headers=headers)
+            return 200 <= resp.status_code < 300
+    except Exception:
+        return False
+
+
+def cost_note(mode: str) -> str:
+    """Stable user-facing note for ``trajectory.extra.cost_usd._note``."""
+    if mode == "isolated_subkey":
+        return (
+            "Total = cumulative USD on a per-trial OpenRouter sub-key. "
+            "Captures every call billed to the sub-key (agent direct calls, "
+            "sub-library internals, subprocess CLIs). Sub-key is created at "
+            "trial start and deleted at trial end."
+        )
+    if mode == "isolated_subkey_query_failed":
+        return (
+            "Sub-key was minted but post-trial usage query failed; sub-key "
+            "deleted (best-effort). No cost data available."
+        )
+    if mode == "shared_key":
+        return (
+            "OPENROUTER_PROVISIONING_KEY not set; trial used the shared "
+            "OPENROUTER_API_KEY. Per-trial cost cannot be isolated from "
+            "concurrent traffic. Set OPENROUTER_PROVISIONING_KEY for exact "
+            "per-trial USD."
+        )
+    return ""
+
+
+@asynccontextmanager
+async def trial_subkey(
+    *,
+    provisioning_key: str | None,
+    fallback_key: str,
+    label: str,
+    limit_usd: float | None = 5.00,
+    settle_seconds: float = 5.0,
+):
+    """Yield a :class:`TrialKeyState`. Mutates ``usage_usd`` + ``mode`` after exit.
+
+    If ``provisioning_key`` is set: mints a sub-key for the trial, hands it
+    to the caller as ``state.key``, snapshots usage on exit, deletes the
+    sub-key. ``state.usage_usd`` will be the exact USD spent through that
+    sub-key (covering everything billed to it — agent direct calls,
+    sub-libraries, subprocess CLIs).
+
+    If ``provisioning_key`` is None: falls back to ``fallback_key``.
+    ``usage_usd`` stays None (no per-trial attribution available on a
+    shared key).
+
+    ``settle_seconds`` accounts for OpenRouter's activity pipeline lag (a
+    few seconds between completion and ledger update). 5s is conservative
+    but reliable.
+    """
+    if not provisioning_key:
+        state = TrialKeyState(key=fallback_key, mode="shared_key")
+        yield state
+        return
+
+    try:
+        minted = await provision_subkey(
+            provisioning_key, label=label, limit_usd=limit_usd
+        )
+    except Exception:
+        # Fall back gracefully — don't fail the trial because billing
+        # isolation broke.
+        state = TrialKeyState(key=fallback_key, mode="shared_key")
+        yield state
+        return
+
+    state = TrialKeyState(
+        key=minted["key"],
+        mode="isolated_subkey",
+        hash=minted["hash"],
+    )
+    try:
+        yield state
+    finally:
+        if settle_seconds > 0:
+            try:
+                await asyncio.sleep(settle_seconds)
+            except Exception:
+                pass
+        try:
+            state.usage_usd = await subkey_usage(provisioning_key, state.hash or "")
+        except Exception:
+            state.usage_usd = None
+            state.mode = "isolated_subkey_query_failed"
+        if state.hash:
+            await delete_subkey(provisioning_key, state.hash)

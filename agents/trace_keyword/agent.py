@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_utils import read_trace_file, usage_cost
+from agent_utils import cost_note, read_trace_file, trial_subkey, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -294,193 +294,209 @@ class TraceKeywordAgent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-        )
+        api_key = os.environ["OPENROUTER_API_KEY"]
+        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
         model = self.model_name or DEFAULT_MODEL
 
         t_start = time.monotonic()
+        trial_label = f"horizon-trace-keyword-{uuid.uuid4().hex[:8]}"
 
-        # Use download_file (not exec/cat) so we don't truncate at the agent's
-        # stdout cap — production traces can be tens of MB.
-        trace_text = await read_trace_file(environment, TRACE_PATH)
-        all_lines = trace_text.splitlines() if trace_text else []
-
-        chunks = _chunk_by_day(all_lines)
-        chunk_labels = [c[0] for c in chunks]
-        chunk_bodies = [c[1] for c in chunks]
-        chunk_tokens = [_tokenize(body) for body in chunk_bodies]
-
-        bm25 = _BM25()
-        bm25.fit(chunk_tokens)
-
-        # Best-effort delete the file so the model can't shortcut around the
-        # search tool — matches trace_rag's behavior.
-        await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
-
-        t_ingest_done = time.monotonic()
-
-        all_tools = [TRACE_SEARCH_TOOL, SHELL_EXEC_TOOL]
-
-        user_message = (
-            f"You are working on a task. There is no prior-session trace in "
-            f"your prompt — call `trace_search` to recall anything from the "
-            f"prior session. The trace was chunked into {len(chunks)} per-day "
-            f"chunks across {len({c.split('#')[0] for c in chunk_labels})} "
-            f"unique days.\n\nCurrent task:\n\n{instruction}"
-        )
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
-
-        steps: list[Step] = [
-            Step(
-                step_id=1,
-                timestamp=_now_iso(),
-                source="user",
-                message=user_message,
-            )
-        ]
-
+        all_lines: list[str] = []
+        chunks: list[tuple[str, str]] = []
+        chunk_labels: list[str] = []
+        steps: list[Step] = []
         total_pt = total_ct = 0
         chat_cost_usd = 0.0
         searches_done: list[dict[str, Any]] = []
+        t_ingest_done = t_start
+        t_end = t_start
 
-        for _ in range(MAX_STEPS):
-            resp = await _chat_completion_with_retries(
-                client,
-                model=model,
-                messages=messages,
-                tools=all_tools,
-                temperature=0,
-                extra_body={"usage": {"include": True}},
-            )
-            if resp.usage:
-                total_pt += resp.usage.prompt_tokens or 0
-                total_ct += resp.usage.completion_tokens or 0
-            chat_cost_usd += usage_cost(resp)
-            step_metrics = Metrics(
-                prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
-                completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
+        async with trial_subkey(
+            provisioning_key=provisioning_key,
+            fallback_key=api_key,
+            label=trial_label,
+        ) as tk:
+            client = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=tk.key,
             )
 
-            choice = resp.choices[0].message
-            tool_calls = list(choice.tool_calls or [])
+            # Use download_file (not exec/cat) so we don't truncate at the agent's
+            # stdout cap — production traces can be tens of MB.
+            trace_text = await read_trace_file(environment, TRACE_PATH)
+            all_lines = trace_text.splitlines() if trace_text else []
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": choice.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
+            chunks = _chunk_by_day(all_lines)
+            chunk_labels = [c[0] for c in chunks]
+            chunk_bodies = [c[1] for c in chunks]
+            chunk_tokens = [_tokenize(body) for body in chunk_bodies]
+
+            bm25 = _BM25()
+            bm25.fit(chunk_tokens)
+
+            # Best-effort delete the file so the model can't shortcut around the
+            # search tool — matches trace_rag's behavior.
+            await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
+
+            t_ingest_done = time.monotonic()
+
+            all_tools = [TRACE_SEARCH_TOOL, SHELL_EXEC_TOOL]
+
+            user_message = (
+                f"You are working on a task. There is no prior-session trace in "
+                f"your prompt — call `trace_search` to recall anything from the "
+                f"prior session. The trace was chunked into {len(chunks)} per-day "
+                f"chunks across {len({c.split('#')[0] for c in chunk_labels})} "
+                f"unique days.\n\nCurrent task:\n\n{instruction}"
+            )
+
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ]
+
+            steps.append(
+                Step(
+                    step_id=1,
+                    timestamp=_now_iso(),
+                    source="user",
+                    message=user_message,
+                )
+            )
+
+            for _ in range(MAX_STEPS):
+                resp = await _chat_completion_with_retries(
+                    client,
+                    model=model,
+                    messages=messages,
+                    tools=all_tools,
+                    temperature=0,
+                    extra_body={"usage": {"include": True}},
+                )
+                if resp.usage:
+                    total_pt += resp.usage.prompt_tokens or 0
+                    total_ct += resp.usage.completion_tokens or 0
+                chat_cost_usd += usage_cost(resp)
+                step_metrics = Metrics(
+                    prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
+                    completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
+                )
+
+                choice = resp.choices[0].message
+                tool_calls = list(choice.tool_calls or [])
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": choice.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ]
+                        or None,
+                    }
+                )
+
+                if not tool_calls:
+                    steps.append(
+                        Step(
+                            step_id=len(steps) + 1,
+                            timestamp=_now_iso(),
+                            source="agent",
+                            model_name=model,
+                            message=(choice.content or "(done)"),
+                            metrics=step_metrics,
+                        )
+                    )
+                    break
+
+                atif_tool_calls: list[ToolCall] = []
+                observations: list[ObservationResult] = []
+                for tc in tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {"command": tc.function.arguments or ""}
+                    name = tc.function.name
+
+                    if name == "trace_search":
+                        query = str(args.get("query") or "")
+                        k = int(args.get("k") or TOP_K_DEFAULT)
+                        hits = bm25.top_k(_tokenize(query), k)
+                        payload = {
+                            "exit_code": 0,
+                            "stdout": json.dumps(
+                                [
+                                    {
+                                        "chunk_id": chunk_labels[i],
+                                        "score": round(float(s), 4),
+                                        "body": chunk_bodies[i][:6000],
+                                    }
+                                    for i, s in hits
+                                ]
+                            ),
+                            "stderr": "",
                         }
-                        for tc in tool_calls
-                    ]
-                    or None,
-                }
-            )
+                        searches_done.append({"query": query, "k": k, "n_hits": len(hits)})
+                    elif name == "shell_exec":
+                        command = str(args.get("command") or "")
+                        timeout_sec = int(args.get("timeout_sec") or 60)
+                        payload = await _exec_with_retries(
+                            environment,
+                            command,
+                            timeout_sec=timeout_sec,
+                        )
+                    else:
+                        payload = {
+                            "exit_code": 127,
+                            "stdout": "",
+                            "stderr": f"unknown tool: {name}",
+                        }
 
-            if not tool_calls:
+                    atif_tool_calls.append(
+                        ToolCall(
+                            tool_call_id=tc.id,
+                            function_name=name,
+                            arguments=args,
+                        )
+                    )
+                    observations.append(
+                        ObservationResult(
+                            source_call_id=tc.id,
+                            content=json.dumps(payload),
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(payload),
+                        }
+                    )
+
                 steps.append(
                     Step(
                         step_id=len(steps) + 1,
                         timestamp=_now_iso(),
                         source="agent",
                         model_name=model,
-                        message=(choice.content or "(done)"),
+                        message=choice.content or "",
+                        tool_calls=atif_tool_calls,
+                        observation=Observation(results=observations),
                         metrics=step_metrics,
                     )
                 )
-                break
 
-            atif_tool_calls: list[ToolCall] = []
-            observations: list[ObservationResult] = []
-            for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {"command": tc.function.arguments or ""}
-                name = tc.function.name
+            t_end = time.monotonic()
 
-                if name == "trace_search":
-                    query = str(args.get("query") or "")
-                    k = int(args.get("k") or TOP_K_DEFAULT)
-                    hits = bm25.top_k(_tokenize(query), k)
-                    payload = {
-                        "exit_code": 0,
-                        "stdout": json.dumps(
-                            [
-                                {
-                                    "chunk_id": chunk_labels[i],
-                                    "score": round(float(s), 4),
-                                    "body": chunk_bodies[i][:6000],
-                                }
-                                for i, s in hits
-                            ]
-                        ),
-                        "stderr": "",
-                    }
-                    searches_done.append({"query": query, "k": k, "n_hits": len(hits)})
-                elif name == "shell_exec":
-                    command = str(args.get("command") or "")
-                    timeout_sec = int(args.get("timeout_sec") or 60)
-                    payload = await _exec_with_retries(
-                        environment,
-                        command,
-                        timeout_sec=timeout_sec,
-                    )
-                else:
-                    payload = {
-                        "exit_code": 127,
-                        "stdout": "",
-                        "stderr": f"unknown tool: {name}",
-                    }
-
-                atif_tool_calls.append(
-                    ToolCall(
-                        tool_call_id=tc.id,
-                        function_name=name,
-                        arguments=args,
-                    )
-                )
-                observations.append(
-                    ObservationResult(
-                        source_call_id=tc.id,
-                        content=json.dumps(payload),
-                    )
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(payload),
-                    }
-                )
-
-            steps.append(
-                Step(
-                    step_id=len(steps) + 1,
-                    timestamp=_now_iso(),
-                    source="agent",
-                    model_name=model,
-                    message=choice.content or "",
-                    tool_calls=atif_tool_calls,
-                    observation=Observation(results=observations),
-                    metrics=step_metrics,
-                )
-            )
-
-        t_end = time.monotonic()
-
+        # `tk.usage_usd` and `tk.mode` are now resolved.
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),
@@ -505,9 +521,10 @@ class TraceKeywordAgent(BaseAgent):
                     "total": round(t_end - t_start, 3),
                 },
                 "cost_usd": {
-                    "ingest": 0.0,
-                    "chat": round(chat_cost_usd, 6),
-                    "total": round(chat_cost_usd, 6),
+                    "total": tk.usage_usd,
+                    "chat_direct": round(chat_cost_usd, 6),
+                    "mode": tk.mode,
+                    "_note": cost_note(tk.mode),
                 },
             },
         )

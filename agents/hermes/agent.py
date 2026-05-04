@@ -26,10 +26,13 @@ already installed.
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import time
 import uuid
 from datetime import UTC, datetime
 
+from agent_utils import cost_note, trial_subkey
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
     EnvVar,
@@ -314,6 +317,9 @@ class HermesAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or DEFAULT_MODEL
+        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
+        fallback_key = self._resolved_env_vars.get("OPENROUTER_API_KEY", "")
+        trial_label = f"horizon-hermes-{uuid.uuid4().hex[:8]}"
 
         # Prefix the user's instruction with a capabilities preamble so
         # hermes knows it has both (a) prior-session memory via
@@ -340,32 +346,57 @@ class HermesAgent(BaseInstalledAgent):
             f"Task: {instruction.strip()}"
         )
 
-        # Run from /workdir so hermes's built-in `terminal`/`search_files`
-        # tools see the eval's filesystem (the trace at /workdir/, the env
-        # tool CLI at /tools/horizon-tools, state at /state/) instead of
-        # the empty /root home dir.
-        command = (
-            f"cd /workdir && hermes chat -Q -q {shlex.quote(framed_instruction)} "
-            f"--provider openrouter --model {shlex.quote(model)} --yolo"
-        )
-        result = await self.exec_as_root(
-            environment,
-            command,
-            env=self._resolved_env_vars,
-            timeout_sec=900,
-        )
-        (self.logs_dir / "hermes-stdout.txt").write_text(result.stdout or "")
-        (self.logs_dir / "hermes-stderr.txt").write_text(result.stderr or "")
+        t_run_start = time.monotonic()
 
-        # Dump the session we just ran so populate_context_post_run can
-        # convert it to an ATIF trajectory.
-        dump_cmd = (
-            f"cat > /tmp/hermes_dump.py <<'HERMES_DUMP_EOF'\n"
-            f"{DUMP_PY}HERMES_DUMP_EOF\n"
-            f"{HERMES_VENV_PY} /tmp/hermes_dump.py"
-        )
-        dump = await self.exec_as_root(environment, dump_cmd, timeout_sec=60)
-        (self.logs_dir / "hermes-session.json").write_text(dump.stdout or "{}")
+        async with trial_subkey(
+            provisioning_key=provisioning_key,
+            fallback_key=fallback_key,
+            label=trial_label,
+        ) as tk:
+            # Build the env passed to the hermes subprocess. We override
+            # OPENROUTER_API_KEY with the per-trial sub-key so every LLM
+            # call billed by `hermes chat` lands on the sub-key's ledger.
+            run_env = dict(self._resolved_env_vars)
+            run_env["OPENROUTER_API_KEY"] = tk.key
+
+            # Run from /workdir so hermes's built-in `terminal`/`search_files`
+            # tools see the eval's filesystem (the trace at /workdir/, the env
+            # tool CLI at /tools/horizon-tools, state at /state/) instead of
+            # the empty /root home dir.
+            command = (
+                f"cd /workdir && hermes chat -Q -q {shlex.quote(framed_instruction)} "
+                f"--provider openrouter --model {shlex.quote(model)} --yolo"
+            )
+            result = await self.exec_as_root(
+                environment,
+                command,
+                env=run_env,
+                timeout_sec=900,
+            )
+            (self.logs_dir / "hermes-stdout.txt").write_text(result.stdout or "")
+            (self.logs_dir / "hermes-stderr.txt").write_text(result.stderr or "")
+
+            # Dump the session we just ran so populate_context_post_run can
+            # convert it to an ATIF trajectory.
+            dump_cmd = (
+                f"cat > /tmp/hermes_dump.py <<'HERMES_DUMP_EOF'\n"
+                f"{DUMP_PY}HERMES_DUMP_EOF\n"
+                f"{HERMES_VENV_PY} /tmp/hermes_dump.py"
+            )
+            dump = await self.exec_as_root(environment, dump_cmd, timeout_sec=60)
+            (self.logs_dir / "hermes-session.json").write_text(dump.stdout or "{}")
+
+        t_run_end = time.monotonic()
+
+        # Stash trial cost + timing so populate_context_post_run can attach
+        # them to trajectory.extra. tk.usage_usd / tk.mode are resolved
+        # post-context-exit.
+        self._trial_cost_usd = tk.usage_usd
+        self._trial_cost_mode = tk.mode
+        self._trial_timings = {
+            "chat": round(t_run_end - t_run_start, 3),
+            "total": round(t_run_end - t_run_start, 3),
+        }
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         session_path = self.logs_dir / "hermes-session.json"
@@ -428,6 +459,18 @@ class HermesAgent(BaseInstalledAgent):
                 ),
             ]
 
+        cost_mode = getattr(self, "_trial_cost_mode", "shared_key")
+        extra: dict = {
+            "cost_usd": {
+                "total": getattr(self, "_trial_cost_usd", None),
+                "mode": cost_mode,
+                "_note": cost_note(cost_mode),
+            },
+        }
+        timings = getattr(self, "_trial_timings", None)
+        if timings:
+            extra["timing_seconds"] = timings
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(session.get("id") or uuid.uuid4()),
@@ -442,6 +485,7 @@ class HermesAgent(BaseInstalledAgent):
                 total_completion_tokens=total_completion,
                 total_steps=len(steps),
             ),
+            extra=extra,
         )
         (self.logs_dir / "trajectory.json").write_text(
             json.dumps(trajectory.to_json_dict(), indent=2)

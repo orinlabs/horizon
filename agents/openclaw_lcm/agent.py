@@ -29,12 +29,22 @@ seeded raw history.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import shlex
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent_utils import (
+    TrialKeyState,
+    cost_note,
+    delete_subkey,
+    provision_subkey,
+    subkey_usage,
+)
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
     EnvVar,
@@ -127,8 +137,38 @@ class OpenClawLcmAgent(BaseInstalledAgent):
                 "OpenClawLcmAgent requires OPENROUTER_API_KEY; set it in your "
                 "host env before invoking `harbor run`."
             )
-        api_key = self._resolved_env_vars["OPENROUTER_API_KEY"]
+        fallback_key = self._resolved_env_vars["OPENROUTER_API_KEY"]
+        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
         model = self.model_name or DEFAULT_MODEL
+
+        # Mint a per-trial sub-key (or fall back to the shared key) before
+        # any LLM call. The sub-key has to span install (lcm-tui backfill
+        # summarization) AND run (openclaw agent), so we manually
+        # provision here and delete at the end of run() — the
+        # `trial_subkey` async-context-manager can't cover both phases.
+        trial_label = f"horizon-openclaw-lcm-{uuid.uuid4().hex[:8]}"
+        trial_key: TrialKeyState
+        if provisioning_key:
+            try:
+                minted = await provision_subkey(
+                    provisioning_key, label=trial_label, limit_usd=5.00
+                )
+                trial_key = TrialKeyState(
+                    key=minted["key"],
+                    mode="isolated_subkey",
+                    hash=minted["hash"],
+                )
+            except Exception:
+                trial_key = TrialKeyState(key=fallback_key, mode="shared_key")
+        else:
+            trial_key = TrialKeyState(key=fallback_key, mode="shared_key")
+        self._trial_key = trial_key
+        self._trial_provisioning_key = provisioning_key
+        api_key = trial_key.key
+        # Make sure every downstream consumer of `self._resolved_env_vars`
+        # (including run()'s `openclaw agent` invocation) sees the sub-key.
+        self._resolved_env_vars["OPENROUTER_API_KEY"] = api_key
+        self._install_started = time.monotonic()
 
         # Skip the apt + npm install if openclaw is already on PATH (warm
         # cache from a previous trial in the same sandbox).
@@ -412,6 +452,8 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             timeout_sec=60,
         )
 
+        self._install_finished = time.monotonic()
+
     @with_prompt_template
     async def run(
         self,
@@ -423,6 +465,8 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         seed_session = getattr(self, "_seed_session_id", None) or (
             f"{SEED_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
         )
+
+        t_run_start = time.monotonic()
 
         # Mirror the hermes capabilities preamble: the agent needs to know
         # what surfaces are available. lossless-claw's tools (lcm_grep,
@@ -488,6 +532,40 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         )
         (self.logs_dir / "oc-diag.txt").write_text(diag.stdout or "")
 
+        t_run_end = time.monotonic()
+
+        # Snapshot cost on the per-trial sub-key (if any) and best-effort
+        # delete it. The sub-key spanned both install (lcm-tui backfill
+        # gpt-5-mini summarization) and run (openclaw agent), so its
+        # cumulative usage is the trial's exact LLM spend.
+        trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
+        provisioning_key = getattr(self, "_trial_provisioning_key", None)
+        if trial_key is not None and trial_key.mode == "isolated_subkey" and provisioning_key:
+            try:
+                # Brief settle for OpenRouter's activity ledger (a few
+                # seconds of pipeline lag between completion + ledger
+                # update).
+                await asyncio.sleep(5)
+            except Exception:
+                pass
+            try:
+                trial_key.usage_usd = await subkey_usage(
+                    provisioning_key, trial_key.hash or ""
+                )
+            except Exception:
+                trial_key.usage_usd = None
+                trial_key.mode = "isolated_subkey_query_failed"
+            if trial_key.hash:
+                await delete_subkey(provisioning_key, trial_key.hash)
+
+        install_started = getattr(self, "_install_started", t_run_start)
+        install_finished = getattr(self, "_install_finished", t_run_start)
+        self._trial_timings = {
+            "install": round(install_finished - install_started, 3),
+            "chat": round(t_run_end - t_run_start, 3),
+            "total": round(t_run_end - install_started, 3),
+        }
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         stdout_path = self.logs_dir / "openclaw-stdout.txt"
         model = self.model_name or DEFAULT_MODEL
@@ -539,6 +617,20 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             ),
         ]
 
+        trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
+        cost_mode = trial_key.mode if trial_key is not None else "shared_key"
+        cost_total = trial_key.usage_usd if trial_key is not None else None
+        extra: dict = {
+            "cost_usd": {
+                "total": cost_total,
+                "mode": cost_mode,
+                "_note": cost_note(cost_mode),
+            },
+        }
+        timings = getattr(self, "_trial_timings", None)
+        if timings:
+            extra["timing_seconds"] = timings
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=session_id,
@@ -553,6 +645,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
                 total_completion_tokens=usage["completion_tokens"],
                 total_steps=len(steps),
             ),
+            extra=extra,
         )
         (self.logs_dir / "trajectory.json").write_text(
             json.dumps(trajectory.to_json_dict(), indent=2)

@@ -33,7 +33,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_utils import read_trace_file, usage_cost
+from agent_utils import cost_note, read_trace_file, trial_subkey, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -246,275 +246,289 @@ class TraceMem0Agent(BaseAgent):
         from openai import AsyncOpenAI
 
         api_key = os.environ["OPENROUTER_API_KEY"]
-        client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
         chat_model = self.model_name or DEFAULT_CHAT_MODEL
 
         t_start = time.monotonic()
+        trial_label = f"horizon-trace-mem0-{uuid.uuid4().hex[:8]}"
 
-        # Use download_file (not exec/cat) so we don't truncate at the agent's
-        # stdout cap — production traces can be tens of MB.
-        trace_text = await read_trace_file(environment, TRACE_PATH)
-        all_lines = trace_text.splitlines() if trace_text else []
-        recent = all_lines[-MEM0_MAX_EVENTS:]
+        # Collected inside the `async with`; consumed after exit when
+        # building trajectory.extra (so we can include tk.usage_usd).
+        total_pt = total_ct = 0
+        chat_cost_usd = 0.0
+        n_added = 0
+        n_batches = 0
+        ingest_seconds = 0.0
+        all_lines: list[str] = []
+        recent: list[str] = []
+        searches_done: list[dict[str, Any]] = []
+        steps: list[Step] = []
+        t_ingest_done = t_start
+        t_end = t_start
 
-        # Best-effort delete to force the model through memory_search.
-        await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
+        async with trial_subkey(
+            provisioning_key=provisioning_key,
+            fallback_key=api_key,
+            label=trial_label,
+        ) as tk:
+            client = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1", api_key=tk.key
+            )
 
-        chroma_path = tempfile.mkdtemp(prefix="trace_mem0_chroma_")
-        try:
-            memory = _build_mem0(chroma_path, api_key)
+            # Use download_file (not exec/cat) so we don't truncate at the agent's
+            # stdout cap — production traces can be tens of MB.
+            trace_text = await read_trace_file(environment, TRACE_PATH)
+            all_lines = trace_text.splitlines() if trace_text else []
+            recent = all_lines[-MEM0_MAX_EVENTS:]
 
-            ingest_started = time.monotonic()
-            n_added = 0
-            n_batches = 0
-            for i in range(0, len(recent), MEM0_BATCH_SIZE):
-                batch = recent[i : i + MEM0_BATCH_SIZE]
-                msgs = [
-                    {"role": "user", "content": _format_event(line)} for line in batch
+            # Best-effort delete to force the model through memory_search.
+            await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
+
+            chroma_path = tempfile.mkdtemp(prefix="trace_mem0_chroma_")
+            try:
+                memory = _build_mem0(chroma_path, tk.key)
+
+                ingest_started = time.monotonic()
+                for i in range(0, len(recent), MEM0_BATCH_SIZE):
+                    batch = recent[i : i + MEM0_BATCH_SIZE]
+                    msgs = [
+                        {"role": "user", "content": _format_event(line)} for line in batch
+                    ]
+                    try:
+                        result = await asyncio.to_thread(
+                            memory.add, msgs, user_id=MEM0_USER_ID
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "mem0 add batch %d failed: %s: %s",
+                            n_batches,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        continue
+                    n_batches += 1
+                    if isinstance(result, dict):
+                        n_added += len(result.get("results") or [])
+                ingest_seconds = time.monotonic() - ingest_started
+                self.logger.info(
+                    "mem0 ingest: %d events -> %d batches -> %d memories in %.1fs",
+                    len(recent),
+                    n_batches,
+                    n_added,
+                    ingest_seconds,
+                )
+
+                t_ingest_done = time.monotonic()
+
+                all_tools = [MEMORY_SEARCH_TOOL, SHELL_EXEC_TOOL]
+
+                user_message = (
+                    f"You have access to a mem0 memory store seeded from the most "
+                    f"recent {len(recent)} events of a {len(all_lines)}-event prior "
+                    f"session. {n_added} extracted memories are queryable via "
+                    f"`memory_search`. The raw trace is no longer accessible.\n\n"
+                    f"Current task:\n\n{instruction}"
+                )
+
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
                 ]
-                try:
-                    result = await asyncio.to_thread(
-                        memory.add, msgs, user_id=MEM0_USER_ID
+
+                steps.append(
+                    Step(
+                        step_id=1,
+                        timestamp=_now_iso(),
+                        source="user",
+                        message=user_message,
                     )
-                except Exception as exc:
-                    self.logger.warning(
-                        "mem0 add batch %d failed: %s: %s",
-                        n_batches,
-                        type(exc).__name__,
-                        exc,
+                )
+
+                for _ in range(MAX_STEPS):
+                    resp = await _chat_completion_with_retries(
+                        client,
+                        model=chat_model,
+                        messages=messages,
+                        tools=all_tools,
+                        temperature=0,
+                        extra_body={"usage": {"include": True}},
                     )
-                    continue
-                n_batches += 1
-                if isinstance(result, dict):
-                    n_added += len(result.get("results") or [])
-            ingest_seconds = time.monotonic() - ingest_started
-            self.logger.info(
-                "mem0 ingest: %d events -> %d batches -> %d memories in %.1fs",
-                len(recent),
-                n_batches,
-                n_added,
-                ingest_seconds,
-            )
+                    if resp.usage:
+                        total_pt += resp.usage.prompt_tokens or 0
+                        total_ct += resp.usage.completion_tokens or 0
+                    chat_cost_usd += usage_cost(resp)
+                    step_metrics = Metrics(
+                        prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
+                        completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
+                    )
 
-            t_ingest_done = time.monotonic()
+                    choice = resp.choices[0].message
+                    tool_calls = list(choice.tool_calls or [])
 
-            all_tools = [MEMORY_SEARCH_TOOL, SHELL_EXEC_TOOL]
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": choice.content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in tool_calls
+                            ]
+                            or None,
+                        }
+                    )
 
-            user_message = (
-                f"You have access to a mem0 memory store seeded from the most "
-                f"recent {len(recent)} events of a {len(all_lines)}-event prior "
-                f"session. {n_added} extracted memories are queryable via "
-                f"`memory_search`. The raw trace is no longer accessible.\n\n"
-                f"Current task:\n\n{instruction}"
-            )
+                    if not tool_calls:
+                        steps.append(
+                            Step(
+                                step_id=len(steps) + 1,
+                                timestamp=_now_iso(),
+                                source="agent",
+                                model_name=chat_model,
+                                message=(choice.content or "(done)"),
+                                metrics=step_metrics,
+                            )
+                        )
+                        break
 
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ]
+                    atif_tool_calls: list[ToolCall] = []
+                    observations: list[ObservationResult] = []
+                    for tc in tool_calls:
+                        try:
+                            args = json.loads(tc.function.arguments or "{}")
+                        except json.JSONDecodeError:
+                            args = {"command": tc.function.arguments or ""}
+                        name = tc.function.name
 
-            steps: list[Step] = [
-                Step(
-                    step_id=1,
-                    timestamp=_now_iso(),
-                    source="user",
-                    message=user_message,
-                )
-            ]
-
-            total_pt = total_ct = 0
-            chat_cost_usd = 0.0
-            searches_done: list[dict[str, Any]] = []
-
-            for _ in range(MAX_STEPS):
-                resp = await _chat_completion_with_retries(
-                    client,
-                    model=chat_model,
-                    messages=messages,
-                    tools=all_tools,
-                    temperature=0,
-                    extra_body={"usage": {"include": True}},
-                )
-                if resp.usage:
-                    total_pt += resp.usage.prompt_tokens or 0
-                    total_ct += resp.usage.completion_tokens or 0
-                chat_cost_usd += usage_cost(resp)
-                step_metrics = Metrics(
-                    prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
-                    completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
-                )
-
-                choice = resp.choices[0].message
-                tool_calls = list(choice.tool_calls or [])
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": choice.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
+                        if name == "memory_search":
+                            query = str(args.get("query") or "")
+                            k = int(args.get("k") or TOP_K_DEFAULT)
+                            try:
+                                hits = await asyncio.to_thread(
+                                    memory.search,
+                                    query=query,
+                                    user_id=MEM0_USER_ID,
+                                    limit=k,
+                                )
+                            except Exception as exc:
+                                payload = {
+                                    "exit_code": 1,
+                                    "stdout": "",
+                                    "stderr": f"mem0 search failed: {exc!r}",
+                                }
+                            else:
+                                results = hits.get("results", []) if isinstance(hits, dict) else hits
+                                payload = {
+                                    "exit_code": 0,
+                                    "stdout": json.dumps(
+                                        [
+                                            {
+                                                "memory": h.get("memory") if isinstance(h, dict) else str(h),
+                                                "score": h.get("score") if isinstance(h, dict) else None,
+                                            }
+                                            for h in (results or [])
+                                        ]
+                                    ),
+                                    "stderr": "",
+                                }
+                                searches_done.append({"query": query, "k": k, "n_hits": len(results or [])})
+                        elif name == "shell_exec":
+                            command = str(args.get("command") or "")
+                            timeout_sec = int(args.get("timeout_sec") or 60)
+                            payload = await _exec_with_retries(
+                                environment,
+                                command,
+                                timeout_sec=timeout_sec,
+                            )
+                        else:
+                            payload = {
+                                "exit_code": 127,
+                                "stdout": "",
+                                "stderr": f"unknown tool: {name}",
                             }
-                            for tc in tool_calls
-                        ]
-                        or None,
-                    }
-                )
 
-                if not tool_calls:
+                        atif_tool_calls.append(
+                            ToolCall(
+                                tool_call_id=tc.id,
+                                function_name=name,
+                                arguments=args,
+                            )
+                        )
+                        observations.append(
+                            ObservationResult(
+                                source_call_id=tc.id,
+                                content=json.dumps(payload),
+                            )
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": json.dumps(payload),
+                            }
+                        )
+
                     steps.append(
                         Step(
                             step_id=len(steps) + 1,
                             timestamp=_now_iso(),
                             source="agent",
                             model_name=chat_model,
-                            message=(choice.content or "(done)"),
+                            message=choice.content or "",
+                            tool_calls=atif_tool_calls,
+                            observation=Observation(results=observations),
                             metrics=step_metrics,
                         )
                     )
-                    break
 
-                atif_tool_calls: list[ToolCall] = []
-                observations: list[ObservationResult] = []
-                for tc in tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        args = {"command": tc.function.arguments or ""}
-                    name = tc.function.name
+                t_end = time.monotonic()
+            finally:
+                shutil.rmtree(chroma_path, ignore_errors=True)
 
-                    if name == "memory_search":
-                        query = str(args.get("query") or "")
-                        k = int(args.get("k") or TOP_K_DEFAULT)
-                        try:
-                            hits = await asyncio.to_thread(
-                                memory.search,
-                                query=query,
-                                user_id=MEM0_USER_ID,
-                                limit=k,
-                            )
-                        except Exception as exc:
-                            payload = {
-                                "exit_code": 1,
-                                "stdout": "",
-                                "stderr": f"mem0 search failed: {exc!r}",
-                            }
-                        else:
-                            results = hits.get("results", []) if isinstance(hits, dict) else hits
-                            payload = {
-                                "exit_code": 0,
-                                "stdout": json.dumps(
-                                    [
-                                        {
-                                            "memory": h.get("memory") if isinstance(h, dict) else str(h),
-                                            "score": h.get("score") if isinstance(h, dict) else None,
-                                        }
-                                        for h in (results or [])
-                                    ]
-                                ),
-                                "stderr": "",
-                            }
-                            searches_done.append({"query": query, "k": k, "n_hits": len(results or [])})
-                    elif name == "shell_exec":
-                        command = str(args.get("command") or "")
-                        timeout_sec = int(args.get("timeout_sec") or 60)
-                        payload = await _exec_with_retries(
-                            environment,
-                            command,
-                            timeout_sec=timeout_sec,
-                        )
-                    else:
-                        payload = {
-                            "exit_code": 127,
-                            "stdout": "",
-                            "stderr": f"unknown tool: {name}",
-                        }
-
-                    atif_tool_calls.append(
-                        ToolCall(
-                            tool_call_id=tc.id,
-                            function_name=name,
-                            arguments=args,
-                        )
-                    )
-                    observations.append(
-                        ObservationResult(
-                            source_call_id=tc.id,
-                            content=json.dumps(payload),
-                        )
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": json.dumps(payload),
-                        }
-                    )
-
-                steps.append(
-                    Step(
-                        step_id=len(steps) + 1,
-                        timestamp=_now_iso(),
-                        source="agent",
-                        model_name=chat_model,
-                        message=choice.content or "",
-                        tool_calls=atif_tool_calls,
-                        observation=Observation(results=observations),
-                        metrics=step_metrics,
-                    )
-                )
-
-            t_end = time.monotonic()
-
-            trajectory = Trajectory(
-                schema_version=ATIF_VERSION,
-                session_id=str(uuid.uuid4()),
-                agent=Agent(
-                    name=self.name(),
-                    version=self.version() or "unknown",
-                    model_name=chat_model,
-                ),
-                steps=steps,
-                final_metrics=FinalMetrics(
-                    total_prompt_tokens=total_pt,
-                    total_completion_tokens=total_ct,
-                    total_steps=len(steps),
-                ),
-                extra={
-                    "events_total": len(all_lines),
-                    "events_ingested": len(recent),
-                    "ingest_batches": n_batches,
-                    "memories_extracted": n_added,
-                    "ingest_seconds": round(ingest_seconds, 2),
-                    "searches": searches_done,
-                    "timing_seconds": {
-                        "ingest": round(t_ingest_done - t_start, 3),
-                        "chat": round(t_end - t_ingest_done, 3),
-                        "total": round(t_end - t_start, 3),
-                    },
-                    "cost_usd": {
-                        "ingest": None,
-                        "chat": round(chat_cost_usd, 6),
-                        "total": round(chat_cost_usd, 6),
-                        "_note": (
-                            "ingest cost (mem0 LLM-extraction + chroma embeddings) is not "
-                            "metered: mem0 owns its own OpenAI client and does not surface "
-                            "per-call USD. Same for memory_search hits inside the chat loop. "
-                            "chat reflects only this agent's direct chat.completions calls."
-                        ),
-                    },
+        # `tk.usage_usd` and `tk.mode` are now resolved (post-context-exit).
+        trajectory = Trajectory(
+            schema_version=ATIF_VERSION,
+            session_id=str(uuid.uuid4()),
+            agent=Agent(
+                name=self.name(),
+                version=self.version() or "unknown",
+                model_name=chat_model,
+            ),
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=total_pt,
+                total_completion_tokens=total_ct,
+                total_steps=len(steps),
+            ),
+            extra={
+                "events_total": len(all_lines),
+                "events_ingested": len(recent),
+                "ingest_batches": n_batches,
+                "memories_extracted": n_added,
+                "ingest_seconds": round(ingest_seconds, 2),
+                "searches": searches_done,
+                "timing_seconds": {
+                    "ingest": round(t_ingest_done - t_start, 3),
+                    "chat": round(t_end - t_ingest_done, 3),
+                    "total": round(t_end - t_start, 3),
                 },
-            )
-            (self.logs_dir / "trajectory.json").write_text(
-                json.dumps(trajectory.to_json_dict(), indent=2)
-            )
+                "cost_usd": {
+                    "total": tk.usage_usd,
+                    "chat_direct": round(chat_cost_usd, 6),
+                    "mode": tk.mode,
+                    "_note": cost_note(tk.mode),
+                },
+            },
+        )
+        (self.logs_dir / "trajectory.json").write_text(
+            json.dumps(trajectory.to_json_dict(), indent=2)
+        )
 
-            context.n_input_tokens = total_pt
-            context.n_output_tokens = total_ct
-        finally:
-            shutil.rmtree(chroma_path, ignore_errors=True)
+        context.n_input_tokens = total_pt
+        context.n_output_tokens = total_ct

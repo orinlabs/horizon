@@ -56,10 +56,12 @@ import numpy as np
 
 from agent_utils import (
     HorizonToolRegistry,
+    cost_note,
     load_environment_tools,
     read_trace_file,
     summarize_call_log,
     timed_call,
+    trial_subkey,
     usage_cost,
 )
 from harbor.agents.base import BaseAgent
@@ -307,239 +309,259 @@ class TraceRagAgent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-        )
+        api_key = os.environ["OPENROUTER_API_KEY"]
+        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
         chat_model = self.model_name or DEFAULT_CHAT_MODEL
 
         t_start = time.monotonic()
         call_log: list[dict] = []
+        trial_label = f"horizon-trace-rag-{uuid.uuid4().hex[:8]}"
 
-        # ---- Load the task-specific tool registry from the sandbox ----
-        # These are the constrained, eval-author-blessed tools the LLM is
-        # allowed to call (no generic shell). We load them up-front so a
-        # missing/malformed registry fails the run loudly before we burn
-        # any embedding tokens.
-        async with timed_call(call_log, "download", "load tools.json"):
-            tool_registry = await load_environment_tools(environment)
-
-        # ---- Ingest: read trace, chunk by day, embed each chunk ----
-        # Use download_file (not exec/cat) so we don't truncate at the agent's
-        # stdout cap — production traces can be tens of MB.
-        async with timed_call(call_log, "download", "download trace.jsonl"):
-            trace_text = await read_trace_file(environment, TRACE_PATH)
-        lines = trace_text.splitlines()
-        chunks = _chunk_trace_by_day(lines)
-
-        total_embedding_tokens = 0
-        ingest_embedding_cost_usd = 0.0
-        if chunks:
-            embeddings: list[list[float]] = []
-            for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
-                batch = chunks[start : start + EMBEDDING_BATCH_SIZE]
-                batch_idx = start // EMBEDDING_BATCH_SIZE
-                async with timed_call(
-                    call_log,
-                    "embedding",
-                    f"ingest batch {batch_idx} ({len(batch)} chunks)",
-                ):
-                    batch_embeddings, batch_tokens, batch_cost = (
-                        await _create_embeddings_resilient(
-                            client, [c.text for c in batch]
-                        )
-                    )
-                total_embedding_tokens += batch_tokens
-                ingest_embedding_cost_usd += batch_cost
-                embeddings.extend(batch_embeddings)
-            matrix = np.array(embeddings, dtype=np.float32)
-            matrix /= np.linalg.norm(matrix, axis=1, keepdims=True).clip(min=1e-8)
-        else:
-            matrix = np.zeros((0, 1), dtype=np.float32)
-
-        # Remove the trace file so the only way to recall prior history is
-        # through the embedding-ranked retrieval tool. Best-effort: a Modal
-        # stdio blip here is harmless because the LLM is told to use
-        # `trace_search`.
-        async with timed_call(call_log, "exec", "rm trace.jsonl"):
-            await _exec_with_retries(
-                environment, f"rm -f {TRACE_PATH}", timeout_sec=10
-            )
-
-        ingest_note = (
-            f"Ingested {len(chunks)} chunks from {TRACE_PATH}: "
-            f"{_summarize_chunk_ids(chunks)}. "
-            f"Embedded with {EMBEDDING_MODEL} ({total_embedding_tokens} tokens). "
-            f"Trace file deleted to force retrieval through `trace_search`."
-        )
-        self.logger.info(ingest_note)
-
-        # ---- Tool-calling loop ----
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            tool_names=", ".join(f"`{n}`" for n in tool_registry.names) or "(none)"
-        )
-        user_message = (
-            f"Task:\n\n{instruction}\n\n"
-            "You have no direct view of the prior-session trace. Call "
-            "`trace_search` to retrieve relevant day-chunks before acting."
-        )
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-
-        steps: list[Step] = [
-            Step(
-                step_id=1,
-                timestamp=_now_iso(),
-                source="system",
-                message=ingest_note,
-            ),
-            Step(
-                step_id=2,
-                timestamp=_now_iso(),
-                source="user",
-                message=user_message,
-            ),
-        ]
-
-        t_ingest_done = time.monotonic()
-
+        chunks: list[Chunk] = []
+        tool_registry: HorizonToolRegistry | None = None
+        steps: list[Step] = []
         total_prompt = total_completion = 0
         chat_cost_usd = 0.0
+        ingest_embedding_cost_usd = 0.0
         query_embedding_cost_usd = 0.0
-        tools_schema = [TRACE_SEARCH_TOOL, *tool_registry.openrouter_tools]
+        total_embedding_tokens = 0
+        t_ingest_done = t_start
+        t_end = t_start
 
-        for turn_idx in range(MAX_STEPS):
-            async with timed_call(call_log, "chat", f"chat turn {turn_idx + 1}"):
-                resp = await client.chat.completions.create(
-                    model=chat_model,
-                    messages=messages,
-                    tools=tools_schema,
-                    temperature=0,
-                    extra_body={"usage": {"include": True}},
+        async with trial_subkey(
+            provisioning_key=provisioning_key,
+            fallback_key=api_key,
+            label=trial_label,
+        ) as tk:
+            client = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=tk.key,
+            )
+
+            # ---- Load the task-specific tool registry from the sandbox ----
+            # These are the constrained, eval-author-blessed tools the LLM is
+            # allowed to call (no generic shell). We load them up-front so a
+            # missing/malformed registry fails the run loudly before we burn
+            # any embedding tokens.
+            async with timed_call(call_log, "download", "load tools.json"):
+                tool_registry = await load_environment_tools(environment)
+
+            # ---- Ingest: read trace, chunk by day, embed each chunk ----
+            # Use download_file (not exec/cat) so we don't truncate at the agent's
+            # stdout cap — production traces can be tens of MB.
+            async with timed_call(call_log, "download", "download trace.jsonl"):
+                trace_text = await read_trace_file(environment, TRACE_PATH)
+            lines = trace_text.splitlines()
+            chunks = _chunk_trace_by_day(lines)
+
+            if chunks:
+                embeddings: list[list[float]] = []
+                for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+                    batch = chunks[start : start + EMBEDDING_BATCH_SIZE]
+                    batch_idx = start // EMBEDDING_BATCH_SIZE
+                    async with timed_call(
+                        call_log,
+                        "embedding",
+                        f"ingest batch {batch_idx} ({len(batch)} chunks)",
+                    ):
+                        batch_embeddings, batch_tokens, batch_cost = (
+                            await _create_embeddings_resilient(
+                                client, [c.text for c in batch]
+                            )
+                        )
+                    total_embedding_tokens += batch_tokens
+                    ingest_embedding_cost_usd += batch_cost
+                    embeddings.extend(batch_embeddings)
+                matrix = np.array(embeddings, dtype=np.float32)
+                matrix /= np.linalg.norm(matrix, axis=1, keepdims=True).clip(min=1e-8)
+            else:
+                matrix = np.zeros((0, 1), dtype=np.float32)
+
+            # Remove the trace file so the only way to recall prior history is
+            # through the embedding-ranked retrieval tool. Best-effort: a Modal
+            # stdio blip here is harmless because the LLM is told to use
+            # `trace_search`.
+            async with timed_call(call_log, "exec", "rm trace.jsonl"):
+                await _exec_with_retries(
+                    environment, f"rm -f {TRACE_PATH}", timeout_sec=10
                 )
-            if resp.usage:
-                total_prompt += resp.usage.prompt_tokens or 0
-                total_completion += resp.usage.completion_tokens or 0
-            chat_cost_usd += usage_cost(resp)
-            step_metrics = Metrics(
-                prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
-                completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
+
+            ingest_note = (
+                f"Ingested {len(chunks)} chunks from {TRACE_PATH}: "
+                f"{_summarize_chunk_ids(chunks)}. "
+                f"Embedded with {EMBEDDING_MODEL} ({total_embedding_tokens} tokens). "
+                f"Trace file deleted to force retrieval through `trace_search`."
+            )
+            self.logger.info(ingest_note)
+
+            # ---- Tool-calling loop ----
+            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+                tool_names=", ".join(f"`{n}`" for n in tool_registry.names) or "(none)"
+            )
+            user_message = (
+                f"Task:\n\n{instruction}\n\n"
+                "You have no direct view of the prior-session trace. Call "
+                "`trace_search` to retrieve relevant day-chunks before acting."
+            )
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
+
+            steps.extend(
+                [
+                    Step(
+                        step_id=1,
+                        timestamp=_now_iso(),
+                        source="system",
+                        message=ingest_note,
+                    ),
+                    Step(
+                        step_id=2,
+                        timestamp=_now_iso(),
+                        source="user",
+                        message=user_message,
+                    ),
+                ]
             )
 
-            choice = resp.choices[0].message
-            tool_calls = list(choice.tool_calls or [])
+            t_ingest_done = time.monotonic()
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": choice.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
+            tools_schema = [TRACE_SEARCH_TOOL, *tool_registry.openrouter_tools]
+
+            for turn_idx in range(MAX_STEPS):
+                async with timed_call(call_log, "chat", f"chat turn {turn_idx + 1}"):
+                    resp = await client.chat.completions.create(
+                        model=chat_model,
+                        messages=messages,
+                        tools=tools_schema,
+                        temperature=0,
+                        extra_body={"usage": {"include": True}},
+                    )
+                if resp.usage:
+                    total_prompt += resp.usage.prompt_tokens or 0
+                    total_completion += resp.usage.completion_tokens or 0
+                chat_cost_usd += usage_cost(resp)
+                step_metrics = Metrics(
+                    prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
+                    completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
+                )
+
+                choice = resp.choices[0].message
+                tool_calls = list(choice.tool_calls or [])
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": choice.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ]
+                        or None,
+                    }
+                )
+
+                if not tool_calls:
+                    steps.append(
+                        Step(
+                            step_id=len(steps) + 1,
+                            timestamp=_now_iso(),
+                            source="agent",
+                            model_name=chat_model,
+                            message=(choice.content or "(done)"),
+                            metrics=step_metrics,
+                        )
+                    )
+                    break
+
+                atif_tool_calls: list[ToolCall] = []
+                observations: list[ObservationResult] = []
+                for tc in tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {"command": tc.function.arguments or ""}
+                    name = tc.function.name
+                    if name == "trace_search":
+                        async with timed_call(
+                            call_log,
+                            "embedding",
+                            f"trace_search query (turn {turn_idx + 1})",
+                        ):
+                            payload, extra_tokens, extra_cost = await self._run_trace_search(
+                                client, chunks, matrix, args
+                            )
+                        total_embedding_tokens += extra_tokens
+                        query_embedding_cost_usd += extra_cost
+                    elif name in tool_registry:
+                        async with timed_call(
+                            call_log,
+                            "exec",
+                            f"{name} turn {turn_idx + 1}",
+                        ):
+                            payload = await tool_registry.call(
+                                environment,
+                                name,
+                                args,
+                                output_char_cap=MAX_EXEC_OUTPUT_CHARS,
+                            )
+                    else:
+                        payload = {
+                            "exit_code": 127,
+                            "stdout": "",
+                            "stderr": (
+                                f"unknown tool: {name}. Available: trace_search, "
+                                f"{', '.join(tool_registry.names) or '(none)'}."
+                            ),
                         }
-                        for tc in tool_calls
-                    ]
-                    or None,
-                }
-            )
 
-            if not tool_calls:
+                    atif_tool_calls.append(
+                        ToolCall(
+                            tool_call_id=tc.id,
+                            function_name=name,
+                            arguments=args,
+                        )
+                    )
+                    observations.append(
+                        ObservationResult(
+                            source_call_id=tc.id,
+                            content=json.dumps(payload),
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(payload),
+                        }
+                    )
+
                 steps.append(
                     Step(
                         step_id=len(steps) + 1,
                         timestamp=_now_iso(),
                         source="agent",
                         model_name=chat_model,
-                        message=(choice.content or "(done)"),
+                        message=choice.content or "",
+                        tool_calls=atif_tool_calls,
+                        observation=Observation(results=observations),
                         metrics=step_metrics,
                     )
                 )
-                break
 
-            atif_tool_calls: list[ToolCall] = []
-            observations: list[ObservationResult] = []
-            for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {"command": tc.function.arguments or ""}
-                name = tc.function.name
-                if name == "trace_search":
-                    async with timed_call(
-                        call_log,
-                        "embedding",
-                        f"trace_search query (turn {turn_idx + 1})",
-                    ):
-                        payload, extra_tokens, extra_cost = await self._run_trace_search(
-                            client, chunks, matrix, args
-                        )
-                    total_embedding_tokens += extra_tokens
-                    query_embedding_cost_usd += extra_cost
-                elif name in tool_registry:
-                    async with timed_call(
-                        call_log,
-                        "exec",
-                        f"{name} turn {turn_idx + 1}",
-                    ):
-                        payload = await tool_registry.call(
-                            environment,
-                            name,
-                            args,
-                            output_char_cap=MAX_EXEC_OUTPUT_CHARS,
-                        )
-                else:
-                    payload = {
-                        "exit_code": 127,
-                        "stdout": "",
-                        "stderr": (
-                            f"unknown tool: {name}. Available: trace_search, "
-                            f"{', '.join(tool_registry.names) or '(none)'}."
-                        ),
-                    }
+            t_end = time.monotonic()
 
-                atif_tool_calls.append(
-                    ToolCall(
-                        tool_call_id=tc.id,
-                        function_name=name,
-                        arguments=args,
-                    )
-                )
-                observations.append(
-                    ObservationResult(
-                        source_call_id=tc.id,
-                        content=json.dumps(payload),
-                    )
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(payload),
-                    }
-                )
-
-            steps.append(
-                Step(
-                    step_id=len(steps) + 1,
-                    timestamp=_now_iso(),
-                    source="agent",
-                    model_name=chat_model,
-                    message=choice.content or "",
-                    tool_calls=atif_tool_calls,
-                    observation=Observation(results=observations),
-                    metrics=step_metrics,
-                )
-            )
-
-        t_end = time.monotonic()
-
+        # `tk.usage_usd` and `tk.mode` are now resolved.
+        tool_names = tool_registry.names if tool_registry is not None else []
+        direct_total = chat_cost_usd + ingest_embedding_cost_usd + query_embedding_cost_usd
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),
@@ -556,7 +578,7 @@ class TraceRagAgent(BaseAgent):
             ),
             extra={
                 "trace_chunks": [c.id for c in chunks],
-                "tools": tool_registry.names,
+                "tools": tool_names,
                 "embedding_model": EMBEDDING_MODEL,
                 "embedding_tokens": total_embedding_tokens,
                 "timing_seconds": {
@@ -565,12 +587,10 @@ class TraceRagAgent(BaseAgent):
                     "total": round(t_end - t_start, 3),
                 },
                 "cost_usd": {
-                    "ingest": round(ingest_embedding_cost_usd, 6),
-                    "chat": round(chat_cost_usd + query_embedding_cost_usd, 6),
-                    "total": round(
-                        ingest_embedding_cost_usd + chat_cost_usd + query_embedding_cost_usd,
-                        6,
-                    ),
+                    "total": tk.usage_usd,
+                    "direct_total": round(direct_total, 6),
+                    "mode": tk.mode,
+                    "_note": cost_note(tk.mode),
                     "_breakdown": {
                         "ingest_embeddings": round(ingest_embedding_cost_usd, 6),
                         "chat_completions": round(chat_cost_usd, 6),

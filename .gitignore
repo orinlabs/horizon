@@ -12,3 +12,5 @@ logs/
 # Pull with: uv run --with huggingface_hub python scripts/fetch_eval_data.py
 evals/*/environment/workdir/trace.jsonl
 evals/*/data/*.raw.jsonl
+terminals/
+dist/

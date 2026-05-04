@@ -19,10 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_utils import read_trace_file, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -89,7 +91,7 @@ async def _chat_completion_with_retries(client: Any, **kwargs: Any) -> Any:
     last_decode_error: json.JSONDecodeError | None = None
     for attempt in range(3):
         try:
-            return client.chat.completions.create(**kwargs)
+            return await client.chat.completions.create(**kwargs)
         except json.JSONDecodeError as exc:
             last_decode_error = exc
             await asyncio.sleep(1 + attempt)
@@ -170,26 +172,27 @@ class TraceWindowAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
 
-        client = OpenAI(
+        client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ["OPENROUTER_API_KEY"],
         )
         model = self.model_name or DEFAULT_MODEL
         window_size = int(os.environ.get("TRACE_WINDOW_SIZE", WINDOW_SIZE))
 
-        trace_payload = await _exec_with_retries(
-            environment,
-            f"cat {TRACE_PATH} 2>/dev/null || true",
-            timeout_sec=30,
-        )
-        raw = str(trace_payload["stdout"] or "").strip()
-        all_lines = raw.splitlines() if raw else []
+        t_start = time.monotonic()
+
+        # Use download_file (not exec/cat) so we don't truncate at the agent's
+        # stdout cap — production traces can be tens of MB.
+        trace_text = await read_trace_file(environment, TRACE_PATH)
+        all_lines = trace_text.splitlines() if trace_text else []
         recent = all_lines[-window_size:]
         formatted = "\n".join(_format_event(line) for line in recent)
         if not formatted:
             formatted = "(no trace available)"
+
+        t_ingest_done = time.monotonic()
 
         tools = [SHELL_EXEC_TOOL]
 
@@ -216,6 +219,7 @@ class TraceWindowAgent(BaseAgent):
         ]
 
         total_prompt = total_completion = 0
+        chat_cost_usd = 0.0
 
         for _ in range(MAX_STEPS):
             resp = await _chat_completion_with_retries(
@@ -224,10 +228,12 @@ class TraceWindowAgent(BaseAgent):
                 messages=messages,
                 tools=tools,
                 temperature=0,
+                extra_body={"usage": {"include": True}},
             )
             if resp.usage:
                 total_prompt += resp.usage.prompt_tokens or 0
                 total_completion += resp.usage.completion_tokens or 0
+            chat_cost_usd += usage_cost(resp)
             step_metrics = Metrics(
                 prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
                 completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
@@ -326,6 +332,8 @@ class TraceWindowAgent(BaseAgent):
                 )
             )
 
+        t_end = time.monotonic()
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),
@@ -344,6 +352,16 @@ class TraceWindowAgent(BaseAgent):
                 "window_size": window_size,
                 "events_in_window": len(recent),
                 "events_total": len(all_lines),
+                "timing_seconds": {
+                    "ingest": round(t_ingest_done - t_start, 3),
+                    "chat": round(t_end - t_ingest_done, 3),
+                    "total": round(t_end - t_start, 3),
+                },
+                "cost_usd": {
+                    "ingest": 0.0,
+                    "chat": round(chat_cost_usd, 6),
+                    "total": round(chat_cost_usd, 6),
+                },
             },
         )
         (self.logs_dir / "trajectory.json").write_text(

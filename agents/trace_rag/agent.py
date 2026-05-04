@@ -10,14 +10,18 @@ chunks before embedding so long production traces do not exceed provider
 gateway limits. The chunks and their L2-normalized
 embeddings live in memory as a numpy array — no external vector DB.
 
-Retrieval
----------
-The LLM sees ``trace_search(query, k=3)`` plus a generic ``shell_exec``
-tool. The eval's Dockerfile installs per-tool wrappers in
-``/usr/local/bin`` (e.g. ``inbox_list``, ``reply_send``) via
-``horizon-install-tools``, so the model invokes them as plain shell
-commands — same names and flags it can see in the prior trace via
-``trace_search``.
+Retrieval + acting
+------------------
+The LLM sees ``trace_search(query, k=3)`` for prior-session recall, plus
+the **task-specific** tools declared in the sandbox's
+``/.horizon/tools/tools.json`` registry (e.g. ``inbox_list``, ``sms_read``,
+``reply_send``). Those tools are loaded through ``HorizonToolRegistry``
+and exposed as proper OpenRouter function-call entries — the model
+never sees a generic ``shell_exec`` escape hatch, so it can only do
+exactly what the eval author whitelisted. Each tool call is dispatched
+back to its matching ``/usr/local/bin/<tool>`` wrapper via
+``registry.call(...)``, which renders the function-call args into the
+equivalent ``<tool> --flag value`` shell command.
 
 The system prompt tells the agent that nothing about the trace is in the
 user message — it has to call ``trace_search`` to recall anything from the
@@ -50,6 +54,14 @@ from typing import Any
 
 import numpy as np
 
+from agent_utils import (
+    HorizonToolRegistry,
+    load_environment_tools,
+    read_trace_file,
+    summarize_call_log,
+    timed_call,
+    usage_cost,
+)
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -76,17 +88,15 @@ MAX_CHUNK_CHARS = 8_000
 EMBEDDING_BATCH_SIZE = 8
 MAX_EXEC_OUTPUT_CHARS = 12_000
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_TEMPLATE = (
     "You are an autonomous agent.\n\n"
     "You have tools:\n"
     "  - `trace_search`: semantic-search the prior-session trace, which has "
     "been chunked by UTC day and embedded. You have NO other access to the "
     "trace — always call this tool before assuming any prior-session detail.\n"
-    "  - `shell_exec`: run a shell command in the task environment. The prior "
-    "trace shows what shell commands are available (each function_call name "
-    "is installed as a shell command of the same name in `/usr/local/bin` "
-    "with matching `--flag value` arguments). Use this to act on the current "
-    "world.\n\n"
+    "  - Task tools: {tool_names}. Each one matches the shell command of the "
+    "same name in the prior trace; use them to act on the current world. "
+    "There is no generic shell escape hatch.\n\n"
     "Complete the task and stop when its success condition is met."
 )
 
@@ -109,39 +119,19 @@ TRACE_SEARCH_TOOL: dict[str, Any] = {
     },
 }
 
-SHELL_EXEC_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "shell_exec",
-        "description": "Run a shell command in the task environment.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute in the environment.",
-                },
-                "timeout_sec": {
-                    "type": "integer",
-                    "description": "Command timeout in seconds.",
-                    "default": 60,
-                    "minimum": 1,
-                    "maximum": 300,
-                },
-            },
-            "required": ["command"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
 async def _exec_with_retries(
     environment: BaseEnvironment,
     command: str,
     *,
     timeout_sec: int,
 ) -> dict[str, Any]:
+    """Run an internal-only shell command (e.g. ``rm -f trace.jsonl``).
+
+    Kept separate from the model-facing tool surface: the LLM never sees
+    a ``shell_exec`` tool, so this helper is only used by the agent
+    itself for housekeeping (deleting the raw trace post-ingest so the
+    only path to prior-session facts is ``trace_search``).
+    """
     last_error = ""
     for attempt, backoff_sec in enumerate((0.0, 1.0, 2.0, 4.0)):
         if backoff_sec:
@@ -156,6 +146,7 @@ async def _exec_with_retries(
         except Exception as exc:
             last_error = f"attempt {attempt + 1}: {type(exc).__name__}: {exc}"
     return {"exit_code": 1, "stdout": "", "stderr": last_error}
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -314,37 +305,52 @@ class TraceRagAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
 
-        client = OpenAI(
+        client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ["OPENROUTER_API_KEY"],
         )
         chat_model = self.model_name or DEFAULT_CHAT_MODEL
 
+        t_start = time.monotonic()
+        call_log: list[dict] = []
+
+        # ---- Load the task-specific tool registry from the sandbox ----
+        # These are the constrained, eval-author-blessed tools the LLM is
+        # allowed to call (no generic shell). We load them up-front so a
+        # missing/malformed registry fails the run loudly before we burn
+        # any embedding tokens.
+        async with timed_call(call_log, "download", "load tools.json"):
+            tool_registry = await load_environment_tools(environment)
+
         # ---- Ingest: read trace, chunk by day, embed each chunk ----
-        cat_payload = await _exec_with_retries(
-            environment,
-            f"cat {TRACE_PATH} 2>/dev/null || true",
-            timeout_sec=30,
-        )
-        if cat_payload["exit_code"] != 0 and not cat_payload["stdout"]:
-            raise RuntimeError(
-                f"failed to read trace file at {TRACE_PATH}: {cat_payload['stderr']}"
-            )
-        lines = str(cat_payload["stdout"] or "").splitlines()
+        # Use download_file (not exec/cat) so we don't truncate at the agent's
+        # stdout cap — production traces can be tens of MB.
+        async with timed_call(call_log, "download", "download trace.jsonl"):
+            trace_text = await read_trace_file(environment, TRACE_PATH)
+        lines = trace_text.splitlines()
         chunks = _chunk_trace_by_day(lines)
 
         total_embedding_tokens = 0
+        ingest_embedding_cost_usd = 0.0
         if chunks:
             embeddings: list[list[float]] = []
             for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
                 batch = chunks[start : start + EMBEDDING_BATCH_SIZE]
-                batch_embeddings, batch_tokens = _create_embeddings_resilient(
-                    client,
-                    [c.text for c in batch],
-                )
+                batch_idx = start // EMBEDDING_BATCH_SIZE
+                async with timed_call(
+                    call_log,
+                    "embedding",
+                    f"ingest batch {batch_idx} ({len(batch)} chunks)",
+                ):
+                    batch_embeddings, batch_tokens, batch_cost = (
+                        await _create_embeddings_resilient(
+                            client, [c.text for c in batch]
+                        )
+                    )
                 total_embedding_tokens += batch_tokens
+                ingest_embedding_cost_usd += batch_cost
                 embeddings.extend(batch_embeddings)
             matrix = np.array(embeddings, dtype=np.float32)
             matrix /= np.linalg.norm(matrix, axis=1, keepdims=True).clip(min=1e-8)
@@ -355,7 +361,10 @@ class TraceRagAgent(BaseAgent):
         # through the embedding-ranked retrieval tool. Best-effort: a Modal
         # stdio blip here is harmless because the LLM is told to use
         # `trace_search`.
-        await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
+        async with timed_call(call_log, "exec", "rm trace.jsonl"):
+            await _exec_with_retries(
+                environment, f"rm -f {TRACE_PATH}", timeout_sec=10
+            )
 
         ingest_note = (
             f"Ingested {len(chunks)} chunks from {TRACE_PATH}: "
@@ -366,13 +375,16 @@ class TraceRagAgent(BaseAgent):
         self.logger.info(ingest_note)
 
         # ---- Tool-calling loop ----
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            tool_names=", ".join(f"`{n}`" for n in tool_registry.names) or "(none)"
+        )
         user_message = (
             f"Task:\n\n{instruction}\n\n"
             "You have no direct view of the prior-session trace. Call "
             "`trace_search` to retrieve relevant day-chunks before acting."
         )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
 
@@ -391,19 +403,26 @@ class TraceRagAgent(BaseAgent):
             ),
         ]
 
-        total_prompt = total_completion = 0
-        tools_schema = [TRACE_SEARCH_TOOL, SHELL_EXEC_TOOL]
+        t_ingest_done = time.monotonic()
 
-        for _ in range(MAX_STEPS):
-            resp = client.chat.completions.create(
-                model=chat_model,
-                messages=messages,
-                tools=tools_schema,
-                temperature=0,
-            )
+        total_prompt = total_completion = 0
+        chat_cost_usd = 0.0
+        query_embedding_cost_usd = 0.0
+        tools_schema = [TRACE_SEARCH_TOOL, *tool_registry.openrouter_tools]
+
+        for turn_idx in range(MAX_STEPS):
+            async with timed_call(call_log, "chat", f"chat turn {turn_idx + 1}"):
+                resp = await client.chat.completions.create(
+                    model=chat_model,
+                    messages=messages,
+                    tools=tools_schema,
+                    temperature=0,
+                    extra_body={"usage": {"include": True}},
+                )
             if resp.usage:
                 total_prompt += resp.usage.prompt_tokens or 0
                 total_completion += resp.usage.completion_tokens or 0
+            chat_cost_usd += usage_cost(resp)
             step_metrics = Metrics(
                 prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
                 completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
@@ -453,23 +472,36 @@ class TraceRagAgent(BaseAgent):
                     args = {"command": tc.function.arguments or ""}
                 name = tc.function.name
                 if name == "trace_search":
-                    payload, extra_tokens = self._run_trace_search(
-                        client, chunks, matrix, args
-                    )
+                    async with timed_call(
+                        call_log,
+                        "embedding",
+                        f"trace_search query (turn {turn_idx + 1})",
+                    ):
+                        payload, extra_tokens, extra_cost = await self._run_trace_search(
+                            client, chunks, matrix, args
+                        )
                     total_embedding_tokens += extra_tokens
-                elif name == "shell_exec":
-                    command = str(args.get("command") or "")
-                    timeout_sec = int(args.get("timeout_sec") or 60)
-                    payload = await _exec_with_retries(
-                        environment,
-                        command,
-                        timeout_sec=timeout_sec,
-                    )
+                    query_embedding_cost_usd += extra_cost
+                elif name in tool_registry:
+                    async with timed_call(
+                        call_log,
+                        "exec",
+                        f"{name} turn {turn_idx + 1}",
+                    ):
+                        payload = await tool_registry.call(
+                            environment,
+                            name,
+                            args,
+                            output_char_cap=MAX_EXEC_OUTPUT_CHARS,
+                        )
                 else:
                     payload = {
                         "exit_code": 127,
                         "stdout": "",
-                        "stderr": f"unknown tool: {name}",
+                        "stderr": (
+                            f"unknown tool: {name}. Available: trace_search, "
+                            f"{', '.join(tool_registry.names) or '(none)'}."
+                        ),
                     }
 
                 atif_tool_calls.append(
@@ -506,6 +538,8 @@ class TraceRagAgent(BaseAgent):
                 )
             )
 
+        t_end = time.monotonic()
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),
@@ -522,8 +556,29 @@ class TraceRagAgent(BaseAgent):
             ),
             extra={
                 "trace_chunks": [c.id for c in chunks],
+                "tools": tool_registry.names,
                 "embedding_model": EMBEDDING_MODEL,
                 "embedding_tokens": total_embedding_tokens,
+                "timing_seconds": {
+                    "ingest": round(t_ingest_done - t_start, 3),
+                    "chat": round(t_end - t_ingest_done, 3),
+                    "total": round(t_end - t_start, 3),
+                },
+                "cost_usd": {
+                    "ingest": round(ingest_embedding_cost_usd, 6),
+                    "chat": round(chat_cost_usd + query_embedding_cost_usd, 6),
+                    "total": round(
+                        ingest_embedding_cost_usd + chat_cost_usd + query_embedding_cost_usd,
+                        6,
+                    ),
+                    "_breakdown": {
+                        "ingest_embeddings": round(ingest_embedding_cost_usd, 6),
+                        "chat_completions": round(chat_cost_usd, 6),
+                        "query_embeddings": round(query_embedding_cost_usd, 6),
+                    },
+                },
+                "call_summary": summarize_call_log(call_log),
+                "call_log": call_log,
             },
         )
         (self.logs_dir / "trajectory.json").write_text(
@@ -533,19 +588,21 @@ class TraceRagAgent(BaseAgent):
         context.n_input_tokens = total_prompt
         context.n_output_tokens = total_completion
 
-    def _run_trace_search(
+    async def _run_trace_search(
         self,
         client: Any,
         chunks: list[Chunk],
         matrix: np.ndarray,
         args: dict[str, Any],
-    ) -> tuple[dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], int, float]:
         query = str(args.get("query") or "").strip()
         k = int(args.get("k") or TOP_K_DEFAULT)
         if not query or not chunks:
-            return {"hits": [], "note": "empty query or empty trace"}, 0
+            return {"hits": [], "note": "empty query or empty trace"}, 0, 0.0
 
-        embeddings, embed_tokens = _create_embeddings_resilient(client, [query])
+        embeddings, embed_tokens, embed_cost = await _create_embeddings_resilient(
+            client, [query]
+        )
         q = np.array(embeddings[0], dtype=np.float32)
         q /= np.linalg.norm(q).clip(min=1e-8)
 
@@ -559,42 +616,54 @@ class TraceRagAgent(BaseAgent):
             }
             for i in top_idx
         ]
-        return {"hits": hits}, embed_tokens
+        return {"hits": hits}, embed_tokens, embed_cost
 
 
-def _create_embeddings_resilient(
+async def _create_embeddings_resilient(
     client: Any,
     inputs: list[str],
     *,
     attempt: int = 0,
-) -> tuple[list[list[float]], int]:
-    """Create embeddings, splitting batches if OpenRouter drops a response."""
+) -> tuple[list[list[float]], int, float]:
+    """Create embeddings, splitting batches if OpenRouter drops a response.
+
+    Returns ``(embeddings, total_tokens, total_usd_cost)``. Cost is 0.0 when
+    the provider didn't surface a per-call USD figure (the request asks for
+    one via ``extra_body={"usage": {"include": True}}``).
+    """
     if not inputs:
-        return [], 0
+        return [], 0, 0.0
     try:
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=inputs)
+        resp = await client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=inputs,
+            extra_body={"usage": {"include": True}},
+        )
         data = list(resp.data or [])
         if len(data) != len(inputs):
             raise ValueError(
                 f"embedding response length mismatch: got {len(data)}, expected {len(inputs)}"
             )
         tokens = (resp.usage.total_tokens if resp.usage else 0) or 0
-        return [d.embedding for d in data], tokens
+        cost = usage_cost(resp)
+        return [d.embedding for d in data], tokens, cost
     except Exception:
         if len(inputs) > 1:
             mid = len(inputs) // 2
-            left, left_tokens = _create_embeddings_resilient(
+            left, left_tokens, left_cost = await _create_embeddings_resilient(
                 client,
                 inputs[:mid],
                 attempt=attempt,
             )
-            right, right_tokens = _create_embeddings_resilient(
+            right, right_tokens, right_cost = await _create_embeddings_resilient(
                 client,
                 inputs[mid:],
                 attempt=attempt,
             )
-            return left + right, left_tokens + right_tokens
+            return left + right, left_tokens + right_tokens, left_cost + right_cost
         if attempt < 2:
-            time.sleep(1 + attempt)
-            return _create_embeddings_resilient(client, inputs, attempt=attempt + 1)
+            await asyncio.sleep(1 + attempt)
+            return await _create_embeddings_resilient(
+                client, inputs, attempt=attempt + 1
+            )
         raise

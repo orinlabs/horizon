@@ -33,6 +33,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_utils import read_trace_file, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -155,7 +156,7 @@ async def _chat_completion_with_retries(client: Any, **kwargs: Any) -> Any:
     last_decode_error: json.JSONDecodeError | None = None
     for attempt in range(3):
         try:
-            return client.chat.completions.create(**kwargs)
+            return await client.chat.completions.create(**kwargs)
         except json.JSONDecodeError as exc:
             last_decode_error = exc
             await asyncio.sleep(1 + attempt)
@@ -242,21 +243,18 @@ class TraceMem0Agent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
 
         api_key = os.environ["OPENROUTER_API_KEY"]
-        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         chat_model = self.model_name or DEFAULT_CHAT_MODEL
 
-        trace_payload = await _exec_with_retries(
-            environment,
-            f"cat {TRACE_PATH} 2>/dev/null || true",
-            timeout_sec=30,
-        )
-        if trace_payload["exit_code"] != 0 and not trace_payload["stdout"]:
-            raise RuntimeError(f"failed to read trace: {trace_payload['stderr']}")
-        raw = str(trace_payload["stdout"] or "").strip()
-        all_lines = raw.splitlines() if raw else []
+        t_start = time.monotonic()
+
+        # Use download_file (not exec/cat) so we don't truncate at the agent's
+        # stdout cap — production traces can be tens of MB.
+        trace_text = await read_trace_file(environment, TRACE_PATH)
+        all_lines = trace_text.splitlines() if trace_text else []
         recent = all_lines[-MEM0_MAX_EVENTS:]
 
         # Best-effort delete to force the model through memory_search.
@@ -298,6 +296,8 @@ class TraceMem0Agent(BaseAgent):
                 ingest_seconds,
             )
 
+            t_ingest_done = time.monotonic()
+
             all_tools = [MEMORY_SEARCH_TOOL, SHELL_EXEC_TOOL]
 
             user_message = (
@@ -323,6 +323,7 @@ class TraceMem0Agent(BaseAgent):
             ]
 
             total_pt = total_ct = 0
+            chat_cost_usd = 0.0
             searches_done: list[dict[str, Any]] = []
 
             for _ in range(MAX_STEPS):
@@ -332,10 +333,12 @@ class TraceMem0Agent(BaseAgent):
                     messages=messages,
                     tools=all_tools,
                     temperature=0,
+                    extra_body={"usage": {"include": True}},
                 )
                 if resp.usage:
                     total_pt += resp.usage.prompt_tokens or 0
                     total_ct += resp.usage.completion_tokens or 0
+                chat_cost_usd += usage_cost(resp)
                 step_metrics = Metrics(
                     prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
                     completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
@@ -466,6 +469,8 @@ class TraceMem0Agent(BaseAgent):
                     )
                 )
 
+            t_end = time.monotonic()
+
             trajectory = Trajectory(
                 schema_version=ATIF_VERSION,
                 session_id=str(uuid.uuid4()),
@@ -487,6 +492,22 @@ class TraceMem0Agent(BaseAgent):
                     "memories_extracted": n_added,
                     "ingest_seconds": round(ingest_seconds, 2),
                     "searches": searches_done,
+                    "timing_seconds": {
+                        "ingest": round(t_ingest_done - t_start, 3),
+                        "chat": round(t_end - t_ingest_done, 3),
+                        "total": round(t_end - t_start, 3),
+                    },
+                    "cost_usd": {
+                        "ingest": None,
+                        "chat": round(chat_cost_usd, 6),
+                        "total": round(chat_cost_usd, 6),
+                        "_note": (
+                            "ingest cost (mem0 LLM-extraction + chroma embeddings) is not "
+                            "metered: mem0 owns its own OpenAI client and does not surface "
+                            "per-call USD. Same for memory_search hits inside the chat loop. "
+                            "chat reflects only this agent's direct chat.completions calls."
+                        ),
+                    },
                 },
             )
             (self.logs_dir / "trajectory.json").write_text(

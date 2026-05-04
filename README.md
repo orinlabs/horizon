@@ -17,7 +17,7 @@ Horizon-1 measures whether an agent can acquire learnings from a long first-pers
 
 ## Structure
 
-The bulk of Horizon-1 is private to prevent overfitting. We have included a few example eval cases in this public repo, including a public `[HuggingFace dataset](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces)` of traces, to show how the benchmark is structured.
+The bulk of Horizon-1 is private to prevent overfitting. We have included a few example eval cases in this public repo, including a public [HuggingFace dataset](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces) of traces, to show how the benchmark is structured.
 
 Each trace is downloaded into the environment image at build time. Each agent is given a chance to ingest this trace however it wants before the task starts. Then, the task starts and the agent must use the trace (or any derived representations of it) to complete the task.
 

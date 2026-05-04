@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_utils import (
+    OPENROUTER_TRIAL_LIMIT_USD,
     TrialKeyState,
     cost_note,
     delete_subkey,
@@ -151,7 +152,9 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         if provisioning_key:
             try:
                 minted = await provision_subkey(
-                    provisioning_key, label=trial_label, limit_usd=5.00
+                    provisioning_key,
+                    label=trial_label,
+                    limit_usd=OPENROUTER_TRIAL_LIMIT_USD,
                 )
                 trial_key = TrialKeyState(
                     key=minted["key"],

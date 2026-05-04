@@ -26,6 +26,21 @@ from harbor.environments.base import BaseEnvironment
 DEFAULT_TOOL_REGISTRY_PATH = "/.horizon/tools/tools.json"
 DEFAULT_TOOL_OUTPUT_CHAR_CAP = 12_000
 
+# Hard ceiling on USD that any one trial can spend on its disposable
+# OpenRouter sub-key. OpenRouter enforces this server-side: once
+# cumulative spend on the child key crosses the cap, subsequent
+# requests against that key return HTTP 402 and surface as a normal
+# LLM error in the agent. Pick a value generous enough that a real
+# trial doesn't trip it under normal token use, but tight enough that
+# a runaway loop or a regression in a sub-library can't drain the
+# global budget.
+#
+# Adjust here, in one place, if a future agent's expected per-trial
+# spend changes. Intentionally NOT an env var — keeping it a code
+# constant means the chosen ceiling is auditable in PR review and
+# git history.
+OPENROUTER_TRIAL_LIMIT_USD: float = 20.00
+
 
 def usage_cost(resp: Any) -> float:
     """Extract per-call USD cost from an OpenRouter chat/embedding response.
@@ -471,7 +486,10 @@ class TrialKeyState:
 
 
 async def provision_subkey(
-    provisioning_key: str, *, label: str, limit_usd: float | None = 5.00
+    provisioning_key: str,
+    *,
+    label: str,
+    limit_usd: float | None = OPENROUTER_TRIAL_LIMIT_USD,
 ) -> dict[str, str]:
     """Mint a disposable OpenRouter API key. Returns ``{"key": str, "hash": str}``.
 
@@ -554,7 +572,7 @@ async def trial_subkey(
     provisioning_key: str | None,
     fallback_key: str,
     label: str,
-    limit_usd: float | None = 5.00,
+    limit_usd: float | None = OPENROUTER_TRIAL_LIMIT_USD,
     settle_seconds: float = 5.0,
 ):
     """Yield a :class:`TrialKeyState`. Mutates ``usage_usd`` + ``mode`` after exit.

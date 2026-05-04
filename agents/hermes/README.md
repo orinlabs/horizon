@@ -86,10 +86,12 @@ export OPENROUTER_API_KEY=sk-or-...           # fallback used if provisioning fa
 ```
 
 The agent mints a disposable OpenRouter sub-key per trial (capped at
-$5.00 by default), routes the `hermes chat` subprocess's traffic through
-it, snapshots usage at trial end, and deletes the sub-key.
+`OPENROUTER_TRIAL_LIMIT_USD` in `agents/agent_utils.py`, currently
+$20.00), routes the `hermes chat` subprocess's traffic through it,
+snapshots usage at trial end, and deletes the sub-key.
 `trajectory.extra.cost_usd.total` is then exact USD spent by the trial,
-including subprocess CLI calls.
+including subprocess CLI calls. If a trial exceeds the cap, OpenRouter
+returns HTTP 402 and the agent surfaces it as a normal LLM error.
 
 Without `OPENROUTER_PROVISIONING_KEY`, trials run on the shared
 `OPENROUTER_API_KEY` and per-trial cost can't be isolated from

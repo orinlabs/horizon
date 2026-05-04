@@ -556,6 +556,13 @@ def cost_note(mode: str) -> str:
             "Sub-key was minted but post-trial usage query failed; sub-key "
             "deleted (best-effort). No cost data available."
         )
+    if mode == "isolated_subkey_provision_failed":
+        return (
+            "OPENROUTER_PROVISIONING_KEY was set but the sub-key mint call "
+            "failed (transient API error, expired/invalid provisioning "
+            "credential, or network issue). Trial fell back to the shared "
+            "OPENROUTER_API_KEY; per-trial cost cannot be isolated."
+        )
     if mode == "shared_key":
         return (
             "OPENROUTER_PROVISIONING_KEY not set; trial used the shared "
@@ -601,9 +608,16 @@ async def trial_subkey(
             provisioning_key, label=label, limit_usd=limit_usd
         )
     except Exception:
-        # Fall back gracefully — don't fail the trial because billing
-        # isolation broke.
-        state = TrialKeyState(key=fallback_key, mode="shared_key")
+        # Provisioning was attempted but failed (transient API error,
+        # bad provisioning credential, etc.). Fall back to the shared
+        # key so the trial can still run, but flag the mode distinctly
+        # so reviewers can tell this apart from "user never set
+        # OPENROUTER_PROVISIONING_KEY in the first place" — silent
+        # equivalence between those two cases makes sweep-wide sub-key
+        # outages invisible.
+        state = TrialKeyState(
+            key=fallback_key, mode="isolated_subkey_provision_failed"
+        )
         yield state
         return
 

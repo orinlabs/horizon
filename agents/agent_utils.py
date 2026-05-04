@@ -9,13 +9,22 @@ truncation) stays inline in that agent.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import shlex
 import tempfile
 import time
+from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from harbor.environments.base import BaseEnvironment
+
+
+DEFAULT_TOOL_REGISTRY_PATH = "/.horizon/tools/tools.json"
+DEFAULT_TOOL_OUTPUT_CHAR_CAP = 12_000
 
 
 def usage_cost(resp: Any) -> float:
@@ -119,6 +128,293 @@ async def read_trace_file(
             os.unlink(local_path)
         except OSError:
             pass
+
+
+@dataclass(frozen=True)
+class HorizonTool:
+    """A single tool installed in the sandbox by ``horizon-install-tools``.
+
+    Mirrors one entry of ``/.horizon/tools/tools.json``:
+
+    - ``sdk_schema`` is the OpenAI/OpenRouter ``{"type": "function", ...}``
+      tool descriptor — pass straight through to ``tools=[...]`` on chat
+      completions.
+    - ``argv`` + ``arg_map`` describe the equivalent CLI invocation. Each
+      tool has a wrapper at ``/usr/local/bin/<name>`` that just shells
+      through to the registry's ``tool_handler.py``, so calling the tool
+      is literally running ``<name> --flag value ...`` in the sandbox.
+    """
+
+    name: str
+    sdk_schema: dict[str, Any]
+    argv: list[str]
+    arg_map: dict[str, str]
+    handler_type: str = "command"
+
+
+@dataclass
+class HorizonToolRegistry:
+    """All tools loaded from the sandbox's ``tools.json``.
+
+    Exposes the OpenRouter-compatible ``tools`` list for chat completions
+    and a single ``call(...)`` entry point that dispatches a model's
+    function call back to the matching CLI command in the sandbox.
+    """
+
+    tools: list[HorizonTool]
+    schema_version: str = "horizon-tools-v1"
+    _by_name: dict[str, HorizonTool] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._by_name = {t.name: t for t in self.tools}
+
+    @property
+    def openrouter_tools(self) -> list[dict[str, Any]]:
+        """The list to pass as ``tools=`` to ``client.chat.completions.create``."""
+        return [t.sdk_schema for t in self.tools]
+
+    @property
+    def names(self) -> list[str]:
+        return [t.name for t in self.tools]
+
+    def get(self, name: str) -> HorizonTool | None:
+        return self._by_name.get(name)
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and name in self._by_name
+
+    def __len__(self) -> int:
+        return len(self.tools)
+
+    def __iter__(self) -> Iterable[HorizonTool]:
+        return iter(self.tools)
+
+    async def call(
+        self,
+        environment: BaseEnvironment,
+        name: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        timeout_sec: int = 60,
+        output_char_cap: int = DEFAULT_TOOL_OUTPUT_CHAR_CAP,
+        retries: int = 3,
+    ) -> dict[str, Any]:
+        """Dispatch a function call to the matching sandbox CLI command.
+
+        Returns a dict shaped like the agents' existing ``shell_exec``
+        output: ``{"exit_code", "stdout", "stderr", "command"}``. Unknown
+        tool names return ``exit_code=127`` with the error in ``stderr``,
+        matching the established ``shell_exec`` fallback so callers don't
+        need to special-case it before stuffing the payload back into the
+        chat history.
+        """
+        tool = self._by_name.get(name)
+        if tool is None:
+            return {
+                "exit_code": 127,
+                "stdout": "",
+                "stderr": f"unknown tool: {name}",
+                "command": "",
+            }
+        return await call_tool(
+            environment,
+            tool,
+            arguments or {},
+            timeout_sec=timeout_sec,
+            output_char_cap=output_char_cap,
+            retries=retries,
+        )
+
+
+def _parse_tool_entry(entry: Mapping[str, Any]) -> HorizonTool:
+    """Parse one ``tools.json`` entry into a ``HorizonTool``.
+
+    Raises ``ValueError`` with a precise message on schema problems so a
+    broken environment image fails loudly at agent startup instead of
+    silently dropping tools the model is supposed to be able to call.
+    """
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"tools.json entry missing 'name': {entry!r}")
+    sdk_schema = entry.get("sdk_schema")
+    if not isinstance(sdk_schema, dict):
+        raise ValueError(f"tools.json entry {name!r} missing 'sdk_schema'")
+    handler = entry.get("handler") or {}
+    if not isinstance(handler, dict):
+        raise ValueError(f"tools.json entry {name!r} has non-object 'handler'")
+    handler_type = str(handler.get("type") or "command")
+    if handler_type != "command":
+        raise ValueError(
+            f"tools.json entry {name!r} has unsupported handler type "
+            f"{handler_type!r} (only 'command' is supported)"
+        )
+    argv = handler.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        raise ValueError(
+            f"tools.json entry {name!r} has invalid handler.argv: {argv!r}"
+        )
+    arg_map_raw = handler.get("arg_map") or {}
+    if not isinstance(arg_map_raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in arg_map_raw.items()
+    ):
+        raise ValueError(
+            f"tools.json entry {name!r} has invalid handler.arg_map: {arg_map_raw!r}"
+        )
+    return HorizonTool(
+        name=name,
+        sdk_schema=sdk_schema,
+        argv=list(argv),
+        arg_map=dict(arg_map_raw),
+        handler_type=handler_type,
+    )
+
+
+def parse_tool_registry(payload: Mapping[str, Any]) -> HorizonToolRegistry:
+    """Parse a decoded ``tools.json`` document into a ``HorizonToolRegistry``."""
+    raw_tools = payload.get("tools")
+    if not isinstance(raw_tools, list):
+        raise ValueError("tools.json: top-level 'tools' must be a list")
+    parsed = [_parse_tool_entry(t) for t in raw_tools]
+    schema_version = str(payload.get("schema_version") or "horizon-tools-v1")
+    return HorizonToolRegistry(tools=parsed, schema_version=schema_version)
+
+
+async def load_environment_tools(
+    environment: BaseEnvironment,
+    *,
+    registry_path: str = DEFAULT_TOOL_REGISTRY_PATH,
+) -> HorizonToolRegistry:
+    """Download ``tools.json`` from the sandbox and parse it into a registry.
+
+    Uses ``environment.download_file`` rather than ``exec``+``cat`` so
+    we don't truncate the registry at the agent's stdout cap and so we
+    surface a real error if the file is missing instead of returning an
+    empty string. Most evals install a handful of small tools; large
+    registries are still well under any reasonable file-transfer limit.
+    """
+    fd, local_path = tempfile.mkstemp(prefix="horizon_tools_", suffix=".json")
+    os.close(fd)
+    try:
+        await environment.download_file(registry_path, local_path)
+        with open(local_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    finally:
+        try:
+            os.unlink(local_path)
+        except OSError:
+            pass
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"{registry_path}: expected a JSON object, got {type(payload).__name__}"
+        )
+    return parse_tool_registry(payload)
+
+
+def _property_type(tool: HorizonTool, key: str) -> str | None:
+    """Look up the JSON-schema ``type`` for ``key`` in the tool's parameters.
+
+    Used by :func:`build_tool_command` to choose between argparse's two
+    common idioms for booleans and arrays: ``store_true`` (just emit the
+    flag) vs. ``--flag <value>`` (emit flag + stringified value).
+    """
+    fn = tool.sdk_schema.get("function") if isinstance(tool.sdk_schema, dict) else None
+    if not isinstance(fn, dict):
+        return None
+    params = fn.get("parameters") if isinstance(fn, dict) else None
+    if not isinstance(params, dict):
+        return None
+    props = params.get("properties")
+    if not isinstance(props, dict):
+        return None
+    prop = props.get(key)
+    if not isinstance(prop, dict):
+        return None
+    t = prop.get("type")
+    return t if isinstance(t, str) else None
+
+
+def build_tool_command(
+    tool: HorizonTool,
+    arguments: Mapping[str, Any] | None = None,
+) -> str:
+    """Render a function-call's arguments into the equivalent shell command.
+
+    The command is exactly what the model would type if it were driving
+    the sandbox by hand: ``<tool> --flag value --flag value`` etc. Every
+    fragment is run through ``shlex.quote`` so freeform string args
+    (subjects, message bodies, code snippets) survive the shell intact.
+
+    Conventions:
+
+    - ``None`` values are dropped (use the handler's default).
+    - Booleans use argparse's ``store_true`` idiom: emit the flag iff
+      ``True``. Override by giving the schema ``type: "string"`` and
+      passing ``"true"``/``"false"`` if you really want a value form.
+    - Arrays / objects are JSON-encoded and passed as a single value.
+    - Args that aren't in ``arg_map`` get a best-effort ``--kebab-case``
+      flag — this lets the model pass forward-compatible extras the
+      registry author hasn't enumerated yet.
+    """
+    parts: list[str] = list(tool.argv)
+    for key, value in (arguments or {}).items():
+        if value is None:
+            continue
+        flag = tool.arg_map.get(key) or f"--{key.replace('_', '-')}"
+        prop_type = _property_type(tool, key)
+        if prop_type == "boolean" or isinstance(value, bool):
+            if bool(value):
+                parts.append(flag)
+            continue
+        if isinstance(value, (list, dict)) or prop_type in {"array", "object"}:
+            parts.extend([flag, json.dumps(value, separators=(",", ":"))])
+            continue
+        parts.extend([flag, str(value)])
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+async def call_tool(
+    environment: BaseEnvironment,
+    tool: HorizonTool,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    timeout_sec: int = 60,
+    output_char_cap: int = DEFAULT_TOOL_OUTPUT_CHAR_CAP,
+    retries: int = 3,
+) -> dict[str, Any]:
+    """Execute ``tool`` in the sandbox with ``arguments`` and capture output.
+
+    Returns a payload shaped like the existing ``shell_exec`` results
+    (``exit_code``/``stdout``/``stderr``) plus the rendered ``command``
+    string, so trajectory recorders can store the literal CLI invocation
+    next to the LLM-side function call.
+
+    Retries transient ``environment.exec`` failures with exponential
+    backoff (1s, 2s, 4s, ...). The terminal failure is reported as a
+    non-zero exit with the error chain in ``stderr`` rather than raising
+    — matching how the reference agents already feed exec failures back
+    to the model.
+    """
+    command = build_tool_command(tool, arguments)
+    last_error = ""
+    for attempt in range(max(1, retries) + 1):
+        if attempt:
+            await asyncio.sleep(2 ** (attempt - 1))
+        try:
+            result = await environment.exec(command, timeout_sec=timeout_sec)
+            return {
+                "exit_code": result.return_code,
+                "stdout": (result.stdout or "")[-output_char_cap:],
+                "stderr": (result.stderr or "")[-output_char_cap:],
+                "command": command,
+            }
+        except Exception as exc:
+            last_error = f"attempt {attempt + 1}: {type(exc).__name__}: {exc}"
+    return {
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": last_error,
+        "command": command,
+    }
 
 
 def summarize_call_log(call_log: list[dict]) -> dict[str, Any]:

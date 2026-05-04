@@ -10,14 +10,18 @@ chunks before embedding so long production traces do not exceed provider
 gateway limits. The chunks and their L2-normalized
 embeddings live in memory as a numpy array — no external vector DB.
 
-Retrieval
----------
-The LLM sees ``trace_search(query, k=3)`` plus a generic ``shell_exec``
-tool. The eval's Dockerfile installs per-tool wrappers in
-``/usr/local/bin`` (e.g. ``inbox_list``, ``reply_send``) via
-``horizon-install-tools``, so the model invokes them as plain shell
-commands — same names and flags it can see in the prior trace via
-``trace_search``.
+Retrieval + acting
+------------------
+The LLM sees ``trace_search(query, k=3)`` for prior-session recall, plus
+the **task-specific** tools declared in the sandbox's
+``/.horizon/tools/tools.json`` registry (e.g. ``inbox_list``, ``sms_read``,
+``reply_send``). Those tools are loaded through ``HorizonToolRegistry``
+and exposed as proper OpenRouter function-call entries — the model
+never sees a generic ``shell_exec`` escape hatch, so it can only do
+exactly what the eval author whitelisted. Each tool call is dispatched
+back to its matching ``/usr/local/bin/<tool>`` wrapper via
+``registry.call(...)``, which renders the function-call args into the
+equivalent ``<tool> --flag value`` shell command.
 
 The system prompt tells the agent that nothing about the trace is in the
 user message — it has to call ``trace_search`` to recall anything from the
@@ -50,7 +54,14 @@ from typing import Any
 
 import numpy as np
 
-from agent_utils import read_trace_file, summarize_call_log, timed_call, usage_cost
+from agent_utils import (
+    HorizonToolRegistry,
+    load_environment_tools,
+    read_trace_file,
+    summarize_call_log,
+    timed_call,
+    usage_cost,
+)
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -77,17 +88,15 @@ MAX_CHUNK_CHARS = 8_000
 EMBEDDING_BATCH_SIZE = 8
 MAX_EXEC_OUTPUT_CHARS = 12_000
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_TEMPLATE = (
     "You are an autonomous agent.\n\n"
     "You have tools:\n"
     "  - `trace_search`: semantic-search the prior-session trace, which has "
     "been chunked by UTC day and embedded. You have NO other access to the "
     "trace — always call this tool before assuming any prior-session detail.\n"
-    "  - `shell_exec`: run a shell command in the task environment. The prior "
-    "trace shows what shell commands are available (each function_call name "
-    "is installed as a shell command of the same name in `/usr/local/bin` "
-    "with matching `--flag value` arguments). Use this to act on the current "
-    "world.\n\n"
+    "  - Task tools: {tool_names}. Each one matches the shell command of the "
+    "same name in the prior trace; use them to act on the current world. "
+    "There is no generic shell escape hatch.\n\n"
     "Complete the task and stop when its success condition is met."
 )
 
@@ -110,39 +119,19 @@ TRACE_SEARCH_TOOL: dict[str, Any] = {
     },
 }
 
-SHELL_EXEC_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "shell_exec",
-        "description": "Run a shell command in the task environment.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute in the environment.",
-                },
-                "timeout_sec": {
-                    "type": "integer",
-                    "description": "Command timeout in seconds.",
-                    "default": 60,
-                    "minimum": 1,
-                    "maximum": 300,
-                },
-            },
-            "required": ["command"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-
 async def _exec_with_retries(
     environment: BaseEnvironment,
     command: str,
     *,
     timeout_sec: int,
 ) -> dict[str, Any]:
+    """Run an internal-only shell command (e.g. ``rm -f trace.jsonl``).
+
+    Kept separate from the model-facing tool surface: the LLM never sees
+    a ``shell_exec`` tool, so this helper is only used by the agent
+    itself for housekeeping (deleting the raw trace post-ingest so the
+    only path to prior-session facts is ``trace_search``).
+    """
     last_error = ""
     for attempt, backoff_sec in enumerate((0.0, 1.0, 2.0, 4.0)):
         if backoff_sec:
@@ -327,6 +316,14 @@ class TraceRagAgent(BaseAgent):
         t_start = time.monotonic()
         call_log: list[dict] = []
 
+        # ---- Load the task-specific tool registry from the sandbox ----
+        # These are the constrained, eval-author-blessed tools the LLM is
+        # allowed to call (no generic shell). We load them up-front so a
+        # missing/malformed registry fails the run loudly before we burn
+        # any embedding tokens.
+        async with timed_call(call_log, "download", "load tools.json"):
+            tool_registry = await load_environment_tools(environment)
+
         # ---- Ingest: read trace, chunk by day, embed each chunk ----
         # Use download_file (not exec/cat) so we don't truncate at the agent's
         # stdout cap — production traces can be tens of MB.
@@ -378,13 +375,16 @@ class TraceRagAgent(BaseAgent):
         self.logger.info(ingest_note)
 
         # ---- Tool-calling loop ----
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            tool_names=", ".join(f"`{n}`" for n in tool_registry.names) or "(none)"
+        )
         user_message = (
             f"Task:\n\n{instruction}\n\n"
             "You have no direct view of the prior-session trace. Call "
             "`trace_search` to retrieve relevant day-chunks before acting."
         )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
 
@@ -408,7 +408,7 @@ class TraceRagAgent(BaseAgent):
         total_prompt = total_completion = 0
         chat_cost_usd = 0.0
         query_embedding_cost_usd = 0.0
-        tools_schema = [TRACE_SEARCH_TOOL, SHELL_EXEC_TOOL]
+        tools_schema = [TRACE_SEARCH_TOOL, *tool_registry.openrouter_tools]
 
         for turn_idx in range(MAX_STEPS):
             async with timed_call(call_log, "chat", f"chat turn {turn_idx + 1}"):
@@ -482,24 +482,26 @@ class TraceRagAgent(BaseAgent):
                         )
                     total_embedding_tokens += extra_tokens
                     query_embedding_cost_usd += extra_cost
-                elif name == "shell_exec":
-                    command = str(args.get("command") or "")
-                    timeout_sec = int(args.get("timeout_sec") or 60)
+                elif name in tool_registry:
                     async with timed_call(
                         call_log,
                         "exec",
-                        f"shell_exec turn {turn_idx + 1}: {command[:60]}",
+                        f"{name} turn {turn_idx + 1}",
                     ):
-                        payload = await _exec_with_retries(
+                        payload = await tool_registry.call(
                             environment,
-                            command,
-                            timeout_sec=timeout_sec,
+                            name,
+                            args,
+                            output_char_cap=MAX_EXEC_OUTPUT_CHARS,
                         )
                 else:
                     payload = {
                         "exit_code": 127,
                         "stdout": "",
-                        "stderr": f"unknown tool: {name}",
+                        "stderr": (
+                            f"unknown tool: {name}. Available: trace_search, "
+                            f"{', '.join(tool_registry.names) or '(none)'}."
+                        ),
                     }
 
                 atif_tool_calls.append(
@@ -554,6 +556,7 @@ class TraceRagAgent(BaseAgent):
             ),
             extra={
                 "trace_chunks": [c.id for c in chunks],
+                "tools": tool_registry.names,
                 "embedding_model": EMBEDDING_MODEL,
                 "embedding_tokens": total_embedding_tokens,
                 "timing_seconds": {

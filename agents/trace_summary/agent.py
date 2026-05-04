@@ -22,10 +22,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from agent_utils import read_trace_file, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -107,7 +109,7 @@ async def _chat_completion_with_retries(client: Any, **kwargs: Any) -> Any:
     last_decode_error: json.JSONDecodeError | None = None
     for attempt in range(3):
         try:
-            return client.chat.completions.create(**kwargs)
+            return await client.chat.completions.create(**kwargs)
         except json.JSONDecodeError as exc:
             last_decode_error = exc
             await asyncio.sleep(1 + attempt)
@@ -164,7 +166,7 @@ def _bucketize(lines: list[str], bucket_size: int) -> list[list[str]]:
 
 async def _summarize_bucket(
     client: Any, bucket: list[str], summary_model: str
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, float]:
     body = "\n".join(_format_event_for_summary(line) for line in bucket)
     resp = await _chat_completion_with_retries(
         client,
@@ -174,11 +176,12 @@ async def _summarize_bucket(
             {"role": "user", "content": body},
         ],
         temperature=0,
+        extra_body={"usage": {"include": True}},
     )
     text = (resp.choices[0].message.content or "").strip() or "(empty summary)"
     pt = (resp.usage.prompt_tokens if resp.usage else 0) or 0
     ct = (resp.usage.completion_tokens if resp.usage else 0) or 0
-    return text, pt, ct
+    return text, pt, ct, usage_cost(resp)
 
 
 class TraceSummaryAgent(BaseAgent):
@@ -205,22 +208,21 @@ class TraceSummaryAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
 
-        client = OpenAI(
+        client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ["OPENROUTER_API_KEY"],
         )
         chat_model = self.model_name or DEFAULT_MODEL
         summary_model = os.environ.get("TRACE_SUMMARY_MODEL", SUMMARY_MODEL)
 
-        trace_payload = await _exec_with_retries(
-            environment,
-            f"cat {TRACE_PATH} 2>/dev/null || true",
-            timeout_sec=30,
-        )
-        raw = str(trace_payload["stdout"] or "").strip()
-        all_lines = raw.splitlines() if raw else []
+        t_start = time.monotonic()
+
+        # Use download_file (not exec/cat) so we don't truncate at the agent's
+        # stdout cap — production traces can be tens of MB.
+        trace_text = await read_trace_file(environment, TRACE_PATH)
+        all_lines = trace_text.splitlines() if trace_text else []
         n_total = len(all_lines)
 
         live_tail = all_lines[-LIVE_TAIL_EVENTS:]
@@ -234,15 +236,19 @@ class TraceSummaryAgent(BaseAgent):
             buckets = _bucketize(head, bucket_size)
 
         summary_pt = summary_ct = 0
+        summary_cost_usd = 0.0
         summaries: list[str] = []
         for idx, bucket in enumerate(buckets):
-            text, pt, ct = await _summarize_bucket(client, bucket, summary_model)
+            text, pt, ct, cost = await _summarize_bucket(client, bucket, summary_model)
             summary_pt += pt
             summary_ct += ct
+            summary_cost_usd += cost
             summaries.append(f"## Bucket {idx + 1}/{len(buckets)} ({len(bucket)} events)\n{text}")
 
         live_block = "\n".join(_format_event_for_summary(line) for line in live_tail)
         summaries_block = "\n\n".join(summaries) if summaries else "(no older history)"
+
+        t_ingest_done = time.monotonic()
 
         tools = [SHELL_EXEC_TOOL]
 
@@ -268,6 +274,7 @@ class TraceSummaryAgent(BaseAgent):
         ]
 
         chat_pt = chat_ct = 0
+        chat_cost_usd = 0.0
 
         for _ in range(MAX_STEPS):
             resp = await _chat_completion_with_retries(
@@ -276,10 +283,12 @@ class TraceSummaryAgent(BaseAgent):
                 messages=messages,
                 tools=tools,
                 temperature=0,
+                extra_body={"usage": {"include": True}},
             )
             if resp.usage:
                 chat_pt += resp.usage.prompt_tokens or 0
                 chat_ct += resp.usage.completion_tokens or 0
+            chat_cost_usd += usage_cost(resp)
             step_metrics = Metrics(
                 prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
                 completion_tokens=(resp.usage.completion_tokens if resp.usage else 0) or 0,
@@ -381,6 +390,8 @@ class TraceSummaryAgent(BaseAgent):
         total_pt = chat_pt + summary_pt
         total_ct = chat_ct + summary_ct
 
+        t_end = time.monotonic()
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),
@@ -403,6 +414,16 @@ class TraceSummaryAgent(BaseAgent):
                 "summary_model": summary_model,
                 "summary_prompt_tokens": summary_pt,
                 "summary_completion_tokens": summary_ct,
+                "timing_seconds": {
+                    "ingest": round(t_ingest_done - t_start, 3),
+                    "chat": round(t_end - t_ingest_done, 3),
+                    "total": round(t_end - t_start, 3),
+                },
+                "cost_usd": {
+                    "ingest": round(summary_cost_usd, 6),
+                    "chat": round(chat_cost_usd, 6),
+                    "total": round(summary_cost_usd + chat_cost_usd, 6),
+                },
             },
         )
         (self.logs_dir / "trajectory.json").write_text(

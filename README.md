@@ -69,3 +69,12 @@ harbor run \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
+## How agents and environments are split
+
+Each trial has two pieces in two places:
+
+- **The environment** is a sandbox container (Docker locally, or a Daytona/Modal/etc. sandbox in the cloud). It holds the per-trial filesystem state: `/workdir/trace.jsonl`, the per-tool wrappers `horizon-install-tools` placed in `/usr/local/bin`, the `/state` directory the verifier inspects, etc. The sandbox has no internet access (`allow_internet = false`) and runs no agent code — it only executes shell commands the host sends it.
+- **The agent** runs in the `harbor` process on the host (your laptop, a CI runner, wherever you invoked `harbor run`). It owns the conversation history and the `OPENROUTER_API_KEY`, calls the LLM, decides what to do, and dispatches each tool call to its sandbox via `environment.exec(...)`.
+
+When you pass `-n N`, harbor allocates `N` isolated sandboxes AND `N` agent coroutines on the host, all sharing one Python event loop and one HTTP client pool. The sandboxes are perfectly isolated from each other; the agent coroutines are not. **Any synchronous LLM SDK call inside an agent's `run()` will block the event loop and starve the other `N-1` coroutines** — even though their sandboxes are completely independent, they can't dispatch their `environment.exec(...)` calls until the loop is freed. Reference agents in `agents/` use `AsyncOpenAI` and `await` every API call for this reason; if you write your own agent, do the same.
+

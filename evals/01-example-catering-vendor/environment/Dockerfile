@@ -1,6 +1,7 @@
 FROM ghcr.io/orinlabs/horizon-1-environment:latest
 
-COPY tools/ /.horizon/tools/
-COPY trace.jsonl /workdir/trace.jsonl
+ARG HORIZON_EVAL_SLUG=01-example-catering-vendor
 
-RUN horizon-install-tools
+COPY tools/ /.horizon/tools/
+
+RUN horizon-download-trace "$HORIZON_EVAL_SLUG" && horizon-install-tools

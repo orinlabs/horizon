@@ -174,8 +174,7 @@ class TraceWindowAgent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        api_key = os.environ["OPENROUTER_API_KEY"]
-        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         model = self.model_name or DEFAULT_MODEL
         window_size = int(os.environ.get("TRACE_WINDOW_SIZE", WINDOW_SIZE))
 
@@ -191,8 +190,7 @@ class TraceWindowAgent(BaseAgent):
         t_end = t_start
 
         async with trial_subkey(
-            provisioning_key=provisioning_key,
-            fallback_key=api_key,
+            management_key=management_key,
             label=trial_label,
         ) as tk:
             client = AsyncOpenAI(
@@ -348,7 +346,6 @@ class TraceWindowAgent(BaseAgent):
 
             t_end = time.monotonic()
 
-        # `tk.usage_usd` and `tk.mode` are now resolved.
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),

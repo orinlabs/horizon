@@ -77,25 +77,14 @@ The agent stays the same — its fast-path check sees the existing install and s
 
 ## Cost tracking
 
-For per-trial USD attribution, set `OPENROUTER_PROVISIONING_KEY` (a key
-with `keys:create` permission) alongside your `OPENROUTER_API_KEY`:
-
-```bash
-export OPENROUTER_PROVISIONING_KEY=sk-or-prov-...
-export OPENROUTER_API_KEY=sk-or-...           # fallback used if provisioning fails
-```
-
-The agent mints a disposable OpenRouter sub-key per trial (capped at
-`OPENROUTER_TRIAL_LIMIT_USD` in `agents/agent_utils.py`, currently
-$20.00), routes the `hermes chat` subprocess's traffic through it,
-snapshots usage at trial end, and deletes the sub-key.
-`trajectory.extra.cost_usd.total` is then exact USD spent by the trial,
-including subprocess CLI calls. If a trial exceeds the cap, OpenRouter
-returns HTTP 402 and the agent surfaces it as a normal LLM error.
-
-Without `OPENROUTER_PROVISIONING_KEY`, trials run on the shared
-`OPENROUTER_API_KEY` and per-trial cost can't be isolated from
-concurrent traffic. `cost_usd.mode = "shared_key"` documents this.
+The agent mints a disposable OpenRouter sub-key per trial from
+`OPENROUTER_MANAGEMENT_KEY` (capped at `OPENROUTER_TRIAL_LIMIT_USD` in
+`agents/agent_utils.py`, currently $20.00), routes the `hermes chat`
+subprocess's traffic through it, snapshots usage at trial end, and
+deletes the sub-key. `trajectory.extra.cost_usd.total` is then exact
+USD spent by the trial, including subprocess CLI calls. If a trial
+exceeds the cap, OpenRouter returns HTTP 402 and the agent surfaces it
+as a normal LLM error.
 
 ## Architecture notes
 

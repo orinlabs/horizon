@@ -135,8 +135,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
                 "OpenClawLcmAgent requires OPENROUTER_API_KEY; set it in your "
                 "host env before invoking `harbor run`."
             )
-        fallback_key = self._resolved_env_vars["OPENROUTER_API_KEY"]
-        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         model = self.model_name or DEFAULT_MODEL
 
         # Sub-key spans both install (lcm-tui backfill summarization) and
@@ -144,19 +143,33 @@ class OpenClawLcmAgent(BaseInstalledAgent):
         # than the `trial_subkey` context manager (which can't span two
         # methods).
         trial_key = await begin_trial_key(
-            provisioning_key=provisioning_key,
-            fallback_key=fallback_key,
+            management_key=management_key,
             label=f"horizon-openclaw-lcm-{uuid.uuid4().hex[:8]}",
         )
         self._trial_key = trial_key
-        self._trial_provisioning_key = provisioning_key
-        # Mutating _resolved_env_vars here makes every downstream
-        # consumer (lcm-tui backfill env, openclaw agent invocation in
-        # run()) see the sub-key without per-call rewrites.
-        self._resolved_env_vars["OPENROUTER_API_KEY"] = trial_key.key
+        # Build a separate env dict with the sub-key so we don't mutate
+        # the base class's _resolved_env_vars (which would leave a dead
+        # key after finalize deletes the sub-key).
+        self._trial_env = {**self._resolved_env_vars, "OPENROUTER_API_KEY": trial_key.key}
         api_key = trial_key.key
         self._install_started = time.monotonic()
 
+        try:
+            await self._do_install(environment, model, api_key)
+        except BaseException:
+            # If install fails after minting the sub-key, finalize it now
+            # so we don't leak an orphaned key on OpenRouter.
+            await finalize_trial_key(trial_key)
+            raise
+
+        self._install_finished = time.monotonic()
+
+    async def _do_install(
+        self,
+        environment: BaseEnvironment,
+        model: str,
+        api_key: str,
+    ) -> None:
         # Skip the apt + npm install if openclaw is already on PATH (warm
         # cache from a previous trial in the same sandbox).
         probe = await environment.exec(
@@ -405,7 +418,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
                 "     2>&1 | tail -20 || echo 'WARN: backfill failed for '\"$SID\"; "
                 "done < /tmp/lcm-sessions.txt"
             ),
-            env=self._resolved_env_vars,
+            env=self._trial_env,
             timeout_sec=1800,
         )
         # Stash the session id on self so run() picks the same one.
@@ -438,8 +451,6 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             ),
             timeout_sec=60,
         )
-
-        self._install_finished = time.monotonic()
 
     @with_prompt_template
     async def run(
@@ -487,7 +498,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             result = await self.exec_as_root(
                 environment,
                 command,
-                env=self._resolved_env_vars,
+                env=self._trial_env,
                 timeout_sec=1200,
             )
             (self.logs_dir / "openclaw-stdout.txt").write_text(result.stdout or "")
@@ -500,7 +511,6 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             # crash paths so a mid-run exception still snapshots cost.
             await finalize_trial_key(
                 self._trial_key,
-                provisioning_key=self._trial_provisioning_key,
                 overlap=[
                     self._capture_lcm_stats(environment),
                     self._capture_oc_diag(environment),
@@ -588,7 +598,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
 
         trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
         if trial_key is None:
-            trial_key = TrialKeyState(key="", mode="shared_key")
+            trial_key = TrialKeyState(key="")
         extra: dict = {"cost_usd": trial_key.cost_usd_dict()}
         timings = getattr(self, "_trial_timings", None)
         if timings:

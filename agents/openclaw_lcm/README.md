@@ -51,27 +51,15 @@ Total: ~8-12 min wall clock and ~$1-2 per trial.
 
 ## Cost tracking
 
-For per-trial USD attribution, set `OPENROUTER_PROVISIONING_KEY` (a key
-with `keys:create` permission) alongside your `OPENROUTER_API_KEY`:
-
-```bash
-export OPENROUTER_PROVISIONING_KEY=sk-or-prov-...
-export OPENROUTER_API_KEY=sk-or-...           # fallback used if provisioning fails
-```
-
-The agent mints a disposable OpenRouter sub-key once per trial (capped
-at `OPENROUTER_TRIAL_LIMIT_USD` in `agents/agent_utils.py`, currently
-$20.00) and uses it for BOTH phases: `lcm-tui backfill` gpt-5-mini
-summarization in `install()` AND the `openclaw agent` inference loop in
-`run()`. The sub-key's cumulative usage is snapshotted at trial end and
-the key is deleted, so `trajectory.extra.cost_usd.total` reflects the
-trial's exact LLM spend across backfill + chat. If a trial exceeds the
-cap, OpenRouter returns HTTP 402 and the agent surfaces it as a normal
-LLM error.
-
-Without `OPENROUTER_PROVISIONING_KEY`, trials run on the shared
-`OPENROUTER_API_KEY` and per-trial cost can't be isolated from
-concurrent traffic. `cost_usd.mode = "shared_key"` documents this.
+The agent mints a disposable OpenRouter sub-key once per trial from
+`OPENROUTER_MANAGEMENT_KEY` (capped at `OPENROUTER_TRIAL_LIMIT_USD` in
+`agents/agent_utils.py`, currently $20.00) and uses it for BOTH phases:
+`lcm-tui backfill` gpt-5-mini summarization in `install()` AND the
+`openclaw agent` inference loop in `run()`. The sub-key's cumulative
+usage is snapshotted at trial end and the key is deleted, so
+`trajectory.extra.cost_usd.total` reflects the trial's exact LLM spend
+across backfill + chat. If a trial exceeds the cap, OpenRouter returns
+HTTP 402 and the agent surfaces it as a normal LLM error.
 
 ## Pinned versions
 

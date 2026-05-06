@@ -317,8 +317,7 @@ class HermesAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or DEFAULT_MODEL
-        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
-        fallback_key = self._resolved_env_vars.get("OPENROUTER_API_KEY", "")
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         trial_label = f"horizon-hermes-{uuid.uuid4().hex[:8]}"
 
         # Prefix the user's instruction with a capabilities preamble so
@@ -349,8 +348,7 @@ class HermesAgent(BaseInstalledAgent):
         t_run_start = time.monotonic()
 
         async with trial_subkey(
-            provisioning_key=provisioning_key,
-            fallback_key=fallback_key,
+            management_key=management_key,
             label=trial_label,
         ) as tk:
             # Build the env passed to the hermes subprocess. We override
@@ -388,8 +386,7 @@ class HermesAgent(BaseInstalledAgent):
 
         t_run_end = time.monotonic()
 
-        # Stash for populate_context_post_run; tk.usage_usd / tk.mode are
-        # already resolved by trial_subkey's finally block.
+        # Stash for populate_context_post_run.
         self._trial_key = tk
         self._trial_timings = {
             "chat": round(t_run_end - t_run_start, 3),
@@ -459,7 +456,7 @@ class HermesAgent(BaseInstalledAgent):
 
         trial_key: TrialKeyState | None = getattr(self, "_trial_key", None)
         if trial_key is None:
-            trial_key = TrialKeyState(key="", mode="shared_key")
+            trial_key = TrialKeyState(key="")
         extra: dict = {"cost_usd": trial_key.cost_usd_dict()}
         timings = getattr(self, "_trial_timings", None)
         if timings:

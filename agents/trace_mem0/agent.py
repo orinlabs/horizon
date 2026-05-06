@@ -245,15 +245,13 @@ class TraceMem0Agent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        api_key = os.environ["OPENROUTER_API_KEY"]
-        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         chat_model = self.model_name or DEFAULT_CHAT_MODEL
 
         t_start = time.monotonic()
         trial_label = f"horizon-trace-mem0-{uuid.uuid4().hex[:8]}"
 
         # Collected inside the `async with`; consumed after exit when
-        # building trajectory.extra (so we can include tk.usage_usd).
         total_pt = total_ct = 0
         chat_cost_usd = 0.0
         n_added = 0
@@ -267,8 +265,7 @@ class TraceMem0Agent(BaseAgent):
         t_end = t_start
 
         async with trial_subkey(
-            provisioning_key=provisioning_key,
-            fallback_key=api_key,
+            management_key=management_key,
             label=trial_label,
         ) as tk:
             client = AsyncOpenAI(
@@ -491,7 +488,7 @@ class TraceMem0Agent(BaseAgent):
             finally:
                 shutil.rmtree(chroma_path, ignore_errors=True)
 
-        # `tk.usage_usd` and `tk.mode` are now resolved (post-context-exit).
+
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),

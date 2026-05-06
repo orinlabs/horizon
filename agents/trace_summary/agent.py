@@ -210,8 +210,7 @@ class TraceSummaryAgent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        api_key = os.environ["OPENROUTER_API_KEY"]
-        provisioning_key = os.environ.get("OPENROUTER_PROVISIONING_KEY")
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         chat_model = self.model_name or DEFAULT_MODEL
         summary_model = os.environ.get("TRACE_SUMMARY_MODEL", SUMMARY_MODEL)
 
@@ -231,8 +230,7 @@ class TraceSummaryAgent(BaseAgent):
         t_end = t_start
 
         async with trial_subkey(
-            provisioning_key=provisioning_key,
-            fallback_key=api_key,
+            management_key=management_key,
             label=trial_label,
         ) as tk:
             client = AsyncOpenAI(
@@ -408,7 +406,6 @@ class TraceSummaryAgent(BaseAgent):
         total_pt = chat_pt + summary_pt
         total_ct = chat_ct + summary_ct
 
-        # `tk.usage_usd` and `tk.mode` are now resolved.
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
             session_id=str(uuid.uuid4()),

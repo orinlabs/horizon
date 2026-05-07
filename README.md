@@ -23,6 +23,23 @@ Each trace is downloaded into the environment image at build time. Each agent is
 
 The agent is then evaluated on accuracy, speed, and cost.
 
+## What a trace looks like
+
+Each trace is a [JSONL](https://jsonlines.org/) file at `/workdir/trace.jsonl`. One JSON object per line, each with a `timestamp` and a `message_data` payload. The payload mirrors the OpenAI Responses item shape — a `message` (system/user/assistant turn), a `reasoning` summary, a `function_call`, or a `function_call_output` — so any agent that already speaks that schema can ingest a trace with no translation layer.
+
+A short excerpt from `01-example-catering-vendor`:
+
+```jsonl
+{"timestamp": "2026-04-08T14:12:00.000000+00:00", "message_data": {"role": "system", "type": "message", "content": "You are being woken up from sleep. Gather as much information as possible about what's happening. …"}}
+{"timestamp": "2026-04-08T14:12:13.044556+00:00", "message_data": {"id": null, "type": "reasoning", "summary": "Just woke up. I should pull the inbox and the task list in parallel so I have a complete picture of what's open before I start acting on anything specific."}}
+{"timestamp": "2026-04-08T14:12:14.217164+00:00", "message_data": {"id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "name": "email_list", "type": "function_call", "call_id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "arguments": "{\"reasoning\": \"Inbox sweep on wake.\", \"limit\": 10}"}}
+{"timestamp": "2026-04-08T14:12:14.221833+00:00", "message_data": {"type": "function_call_output", "call_id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "output": "INBOX (3 threads)\n- bookings@cedarpointlodge.example  thread_id: th-offsite-venue  …\n- Rosa Lin <rosa@northpierpantry.example>  thread_id: th-northpier  …\n- Jordan Lee <jordan@company.example>  thread_id: th-jordan-budget  …"}}
+{"timestamp": "2026-04-08T14:12:15.032220+00:00", "message_data": {"id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "name": "email_read", "type": "function_call", "call_id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "arguments": "{\"reasoning\": \"Jordan's note is most time-sensitive.\", \"thread_id\": \"th-jordan-budget\"}"}}
+{"timestamp": "2026-04-08T14:12:15.033942+00:00", "message_data": {"type": "function_call_output", "call_id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "output": "THREAD th-jordan-budget\nSubject: Re: June team dinner — please pick a vendor by Friday\nFrom: Jordan Lee <jordan@company.example>\nCasey — please pick the caterer for the June team dinner by end of Friday so finance can cut the deposit. Budget ceiling is $1,400 all-in."}}
+```
+
+Production traces can be tens of MB and tens of thousands of events; the public examples are smaller. Browse the full set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
+
 
 ## Installation
 

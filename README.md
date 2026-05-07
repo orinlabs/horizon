@@ -38,7 +38,7 @@ A short excerpt from `01-example-catering-vendor`:
 {"timestamp": "2026-04-08T14:12:15.033942+00:00", "message_data": {"type": "function_call_output", "call_id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "output": "THREAD th-jordan-budget\nSubject: Re: June team dinner — please pick a vendor by Friday\nFrom: Jordan Lee <jordan@company.example>\nCasey — please pick the caterer for the June team dinner by end of Friday so finance can cut the deposit. Budget ceiling is $1,400 all-in."}}
 ```
 
-Production traces can be tens of MB and tens of thousands of events; the public examples are smaller. Browse the full set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
+Production traces can be tens of MB and tens of thousands of events; the public examples are smaller. Browse the full public set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
 
 
 ## Installation

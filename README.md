@@ -25,9 +25,6 @@ The average trace in the private set is ~30M tokens of data; the public examples
 
 The agent is then evaluated on accuracy, speed, and cost.
 
-## Tasks
-
-
 
 ## Task Example
 

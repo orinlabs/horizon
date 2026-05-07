@@ -13,7 +13,7 @@ A learning benchmark for extremely long-horizon agents, packaged as [Harbor](htt
 
 As agents get more autonomous, their ability to learn on the job has become a critical bottleneck for usefulness. Existing memory benchmarks ([LoCoMo](https://arxiv.org/abs/2402.17753), [LongMemEval](https://arxiv.org/abs/2410.10813)) measure reactive chatbot applications, not autonomous agents. Existing learning benchmarks like [ARC-AGI](https://arcprize.org/) measure acquisition and application of skills, but use sandboxed environments that are not representative of complex work.
 
-Horizon-1 measures whether an agent can acquire learnings from a long first-person history and apply them later in an environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
+Horizon-1 measures whether an agent can acquire learnings from a long first-person history (see task example below) and apply them later in an environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
 
 ## Structure
 

@@ -23,22 +23,28 @@ Each trace is downloaded into the environment image at build time. Each agent is
 
 The agent is then evaluated on accuracy, speed, and cost.
 
-## What a trace looks like
+## Tasks
 
-Each trace is a [JSONL](https://jsonlines.org/) file at `/workdir/trace.jsonl`. One JSON object per line, each with a `timestamp` and a `message_data` payload. The payload mirrors the OpenAI Responses item shape — a `message` (system/user/assistant turn), a `reasoning` summary, a `function_call`, or a `function_call_output` — so any agent that already speaks that schema can ingest a trace with no translation layer.
+Each trace is a [JSONL](https://jsonlines.org/) file at `/workdir/trace.jsonl` in the eval environment.
 
-A short excerpt from `01-example-catering-vendor`:
+The average trace in the private set is ~30M tokens of data; the public examples are much smaller. Browse the full public set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
+
+## Task Example
+
+Imagine that in a past session the agent discovered that `curl` is broken on this machine and switched to `wget`. This would be recorded in the trace as:
 
 ```jsonl
-{"timestamp": "2026-04-08T14:12:00.000000+00:00", "message_data": {"role": "system", "type": "message", "content": "You are being woken up from sleep. Gather as much information as possible about what's happening. …"}}
-{"timestamp": "2026-04-08T14:12:13.044556+00:00", "message_data": {"id": null, "type": "reasoning", "summary": "Just woke up. I should pull the inbox and the task list in parallel so I have a complete picture of what's open before I start acting on anything specific."}}
-{"timestamp": "2026-04-08T14:12:14.217164+00:00", "message_data": {"id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "name": "email_list", "type": "function_call", "call_id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "arguments": "{\"reasoning\": \"Inbox sweep on wake.\", \"limit\": 10}"}}
-{"timestamp": "2026-04-08T14:12:14.221833+00:00", "message_data": {"type": "function_call_output", "call_id": "toolu_qv12RvzCjTPAlLbIzP8JXk", "output": "INBOX (3 threads)\n- bookings@cedarpointlodge.example  thread_id: th-offsite-venue  …\n- Rosa Lin <rosa@northpierpantry.example>  thread_id: th-northpier  …\n- Jordan Lee <jordan@company.example>  thread_id: th-jordan-budget  …"}}
-{"timestamp": "2026-04-08T14:12:15.032220+00:00", "message_data": {"id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "name": "email_read", "type": "function_call", "call_id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "arguments": "{\"reasoning\": \"Jordan's note is most time-sensitive.\", \"thread_id\": \"th-jordan-budget\"}"}}
-{"timestamp": "2026-04-08T14:12:15.033942+00:00", "message_data": {"type": "function_call_output", "call_id": "toolu_euJjskTCSbhYR7Fwb3wwm2", "output": "THREAD th-jordan-budget\nSubject: Re: June team dinner — please pick a vendor by Friday\nFrom: Jordan Lee <jordan@company.example>\nCasey — please pick the caterer for the June team dinner by end of Friday so finance can cut the deposit. Budget ceiling is $1,400 all-in."}}
+{"timestamp": "2026-03-19T09:42:11+00:00", "message_data": {"id": null, "type": "reasoning", "summary": "Need to grab the release tarball. Reaching for curl by default."}}
+{"timestamp": "2026-03-19T09:42:12+00:00", "message_data": {"id": "tc_a1", "name": "shell_exec", "type": "function_call", "call_id": "tc_a1", "arguments": "{\"command\": \"curl -fLO https://files.example.com/release-1.4.2.tar.gz\"}"}}
+{"timestamp": "2026-03-19T09:42:12+00:00", "message_data": {"type": "function_call_output", "call_id": "tc_a1", "output": "curl: symbol lookup error: undefined symbol: SSL_get1_peer_certificate\nexit code: 127"}}
+{"timestamp": "2026-03-19T09:42:14+00:00", "message_data": {"id": null, "type": "reasoning", "summary": "curl is broken on this box — bad libssl link. Falling back to wget."}}
+{"timestamp": "2026-03-19T09:42:15+00:00", "message_data": {"id": "tc_a2", "name": "shell_exec", "type": "function_call", "call_id": "tc_a2", "arguments": "{\"command\": \"wget https://files.example.com/release-1.4.2.tar.gz\"}"}}
+{"timestamp": "2026-03-19T09:42:18+00:00", "message_data": {"type": "function_call_output", "call_id": "tc_a2", "output": "release-1.4.2.tar.gz  100%[==================>]  18.4M ... saved"}}
 ```
 
-Production traces can be tens of MB and tens of thousands of events; the public examples are smaller. Browse the full public set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
+This part of the trace would be buried in hundreds of days of real, unrelated activity. Today it's asked to download another file — does it remember to reach for `wget`, or does it rediscover the breakage by trying `curl` first?
+
+The agent is expected to remember that `curl` is broken and use wget first this time. Reward is assigned based on whether the agent tries to use `curl` or `wget` first. `curl` is the default choice for most models, so if the agent deviates from this behavior, we assume it has learned something from the trace.
 
 
 ## Installation
@@ -92,6 +98,37 @@ harbor run \
   -n 32 \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
+
+## Submitting an agent
+
+We're collecting community submissions for the public leaderboard. The flow is intentionally lightweight — open a PR, then email us.
+
+1. **Drop your agent under `agents/<your-agent-name>/`**, mirroring the layout of an existing reference agent like [`agents/trace_window/`](./agents/trace_window/) or [`agents/trace_shell_context/`](./agents/trace_shell_context/):
+
+   ```
+   agents/<your-agent-name>/
+   ├── __init__.py     # re-export your agent class
+   └── agent.py        # subclass harbor.agents.base.BaseAgent
+   ```
+
+2. **Run it against the public set locally** to confirm it loads end-to-end:
+
+   ```bash
+   harbor run \
+     -d orinlabs/horizon-1-public \
+     --agent-import-path <your_agent_name>.agent:<YourAgentClass> \
+     -m openai/gpt-4o-mini \
+     --ae OPENROUTER_API_KEY=sk-or-...
+   ```
+
+3. **Open a PR against [`orinlabs/horizon-1`](https://github.com/orinlabs/horizon-1)** with just the new `agents/<your-agent-name>/` directory. Don't modify reference agents, the eval set, or the dataset manifest.
+4. **Email [horizon@orinlabs.ai](mailto:horizon@orinlabs.ai)** with a link to the PR. Include the agent name, the model(s) you've validated against, and any setup notes (extra env vars, model assumptions, etc.). We'll run it on the private set, post results to the leaderboard, and merge the PR.
+
+A few things worth knowing before you write the agent:
+
+- The agent runs on the host, not in the sandbox — see [How agents and environments are split](#how-agents-and-environments-are-split) below. **Use async I/O for every LLM call**; a synchronous SDK call inside `run()` will block the shared event loop and starve every other parallel trial.
+- The full trace can be tens of MB. Read it with `await environment.download_file("/workdir/trace.jsonl", …)` (see `agent_utils.read_trace_file` used by the reference agents) instead of `cat`-ing it through `environment.exec`, which truncates at the agent's stdout cap.
+- Don't hard-code tool surfaces. The set of available tools varies per task; the trace's `function_call` items are the source of truth for what's installed in `/usr/local/bin` for that environment.
 
 ## How agents and environments are split
 

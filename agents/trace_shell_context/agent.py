@@ -8,7 +8,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from agent_utils import read_trace_file, usage_cost
+from agent_utils import read_trace_file, trial_subkey, usage_cost
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
@@ -130,160 +130,171 @@ class TraceShellContextAgent(BaseAgent):
     ) -> None:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-        )
+        management_key = os.environ["OPENROUTER_MANAGEMENT_KEY"]
         model = self.model_name or DEFAULT_MODEL
 
         t_start = time.monotonic()
+        trial_label = f"horizon-trace-shell-context-{uuid.uuid4().hex[:8]}"
 
-        # Use download_file (not exec/cat) so we don't truncate at the agent's
-        # stdout cap — production traces can be tens of MB.
-        trace_text = await read_trace_file(environment, TRACE_PATH)
-        if not trace_text:
-            raise RuntimeError(f"failed to read trace at {TRACE_PATH}: file empty or missing")
-
-        t_ingest_done = time.monotonic()
-
-        task_message = f"Current task:\n\n{instruction}"
-        trace_message = (
-            "Full prior-session trace follows. Treat this as the source of truth "
-            "for prior-session facts.\n\n"
-            f"{trace_text}"
-        )
-        conversation: list[dict[str, Any]] = [{"role": "user", "content": task_message}]
-
-        steps: list[Step] = [
-            Step(
-                step_id=1,
-                timestamp=_now_iso(),
-                source="user",
-                message=task_message,
-            )
-        ]
-
+        steps: list[Step] = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
         chat_cost_usd = 0.0
+        trace_text = ""
+        t_ingest_done = t_start
+        t_end = t_start
 
-        for _ in range(MAX_STEPS):
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": trace_message},
-                *conversation,
-            ]
-            resp = await _chat_completion_with_retries(
-                client,
-                model=model,
-                messages=messages,
-                tools=[SHELL_EXEC_TOOL],
-                temperature=0,
-                extra_body={"usage": {"include": True}},
-            )
-            if resp.usage:
-                total_prompt_tokens += resp.usage.prompt_tokens or 0
-                total_completion_tokens += resp.usage.completion_tokens or 0
-            chat_cost_usd += usage_cost(resp)
-            step_metrics = Metrics(
-                prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
-                completion_tokens=(resp.usage.completion_tokens if resp.usage else 0)
-                or 0,
+        async with trial_subkey(
+            management_key=management_key,
+            label=trial_label,
+        ) as tk:
+            client = AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=tk.key,
             )
 
-            choice = resp.choices[0].message
-            tool_calls = list(choice.tool_calls or [])
-            conversation.append(
-                {
-                    "role": "assistant",
-                    "content": choice.content,
-                    "tool_calls": [
-                        {
-                            "id": tool_call.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_call.function.name,
-                                "arguments": tool_call.function.arguments,
-                            },
+            # Use download_file (not exec/cat) so we don't truncate at the agent's
+            # stdout cap — production traces can be tens of MB.
+            trace_text = await read_trace_file(environment, TRACE_PATH)
+            if not trace_text:
+                raise RuntimeError(f"failed to read trace at {TRACE_PATH}: file empty or missing")
+
+            t_ingest_done = time.monotonic()
+
+            task_message = f"Current task:\n\n{instruction}"
+            trace_message = (
+                "Full prior-session trace follows. Treat this as the source of truth "
+                "for prior-session facts.\n\n"
+                f"{trace_text}"
+            )
+            conversation: list[dict[str, Any]] = [{"role": "user", "content": task_message}]
+
+            steps.append(
+                Step(
+                    step_id=1,
+                    timestamp=_now_iso(),
+                    source="user",
+                    message=task_message,
+                )
+            )
+
+            for _ in range(MAX_STEPS):
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": trace_message},
+                    *conversation,
+                ]
+                resp = await _chat_completion_with_retries(
+                    client,
+                    model=model,
+                    messages=messages,
+                    tools=[SHELL_EXEC_TOOL],
+                    temperature=0,
+                    extra_body={"usage": {"include": True}},
+                )
+                if resp.usage:
+                    total_prompt_tokens += resp.usage.prompt_tokens or 0
+                    total_completion_tokens += resp.usage.completion_tokens or 0
+                chat_cost_usd += usage_cost(resp)
+                step_metrics = Metrics(
+                    prompt_tokens=(resp.usage.prompt_tokens if resp.usage else 0) or 0,
+                    completion_tokens=(resp.usage.completion_tokens if resp.usage else 0)
+                    or 0,
+                )
+
+                choice = resp.choices[0].message
+                tool_calls = list(choice.tool_calls or [])
+                conversation.append(
+                    {
+                        "role": "assistant",
+                        "content": choice.content,
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }
+                            for tool_call in tool_calls
+                        ]
+                        or None,
+                    }
+                )
+
+                if not tool_calls:
+                    steps.append(
+                        Step(
+                            step_id=len(steps) + 1,
+                            timestamp=_now_iso(),
+                            source="agent",
+                            model_name=model,
+                            message=choice.content or "(done)",
+                            metrics=step_metrics,
+                        )
+                    )
+                    break
+
+                atif_tool_calls: list[ToolCall] = []
+                observations: list[ObservationResult] = []
+                for tool_call in tool_calls:
+                    try:
+                        args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {"command": tool_call.function.arguments or ""}
+
+                    name = tool_call.function.name
+                    if name != "shell_exec":
+                        payload = {
+                            "exit_code": 127,
+                            "stdout": "",
+                            "stderr": f"unknown tool: {name}",
                         }
-                        for tool_call in tool_calls
-                    ]
-                    or None,
-                }
-            )
+                    else:
+                        command = str(args.get("command") or "")
+                        timeout_sec = int(args.get("timeout_sec") or 60)
+                        payload = await _exec_with_retries(
+                            environment,
+                            command,
+                            timeout_sec=timeout_sec,
+                        )
 
-            if not tool_calls:
+                    atif_tool_calls.append(
+                        ToolCall(
+                            tool_call_id=tool_call.id,
+                            function_name=name,
+                            arguments=args,
+                        )
+                    )
+                    observations.append(
+                        ObservationResult(
+                            source_call_id=tool_call.id,
+                            content=json.dumps(payload),
+                        )
+                    )
+                    conversation.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(payload),
+                        }
+                    )
+
                 steps.append(
                     Step(
                         step_id=len(steps) + 1,
                         timestamp=_now_iso(),
                         source="agent",
                         model_name=model,
-                        message=choice.content or "(done)",
+                        message=choice.content or "",
+                        tool_calls=atif_tool_calls,
+                        observation=Observation(results=observations),
                         metrics=step_metrics,
                     )
                 )
-                break
 
-            atif_tool_calls: list[ToolCall] = []
-            observations: list[ObservationResult] = []
-            for tool_call in tool_calls:
-                try:
-                    args = json.loads(tool_call.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {"command": tool_call.function.arguments or ""}
-
-                name = tool_call.function.name
-                if name != "shell_exec":
-                    payload = {
-                        "exit_code": 127,
-                        "stdout": "",
-                        "stderr": f"unknown tool: {name}",
-                    }
-                else:
-                    command = str(args.get("command") or "")
-                    timeout_sec = int(args.get("timeout_sec") or 60)
-                    payload = await _exec_with_retries(
-                        environment,
-                        command,
-                        timeout_sec=timeout_sec,
-                    )
-
-                atif_tool_calls.append(
-                    ToolCall(
-                        tool_call_id=tool_call.id,
-                        function_name=name,
-                        arguments=args,
-                    )
-                )
-                observations.append(
-                    ObservationResult(
-                        source_call_id=tool_call.id,
-                        content=json.dumps(payload),
-                    )
-                )
-                conversation.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(payload),
-                    }
-                )
-
-            steps.append(
-                Step(
-                    step_id=len(steps) + 1,
-                    timestamp=_now_iso(),
-                    source="agent",
-                    model_name=model,
-                    message=choice.content or "",
-                    tool_calls=atif_tool_calls,
-                    observation=Observation(results=observations),
-                    metrics=step_metrics,
-                )
-            )
-
-        t_end = time.monotonic()
+            t_end = time.monotonic()
 
         trajectory = Trajectory(
             schema_version=ATIF_VERSION,
@@ -308,11 +319,7 @@ class TraceShellContextAgent(BaseAgent):
                     "chat": round(t_end - t_ingest_done, 3),
                     "total": round(t_end - t_start, 3),
                 },
-                "cost_usd": {
-                    "ingest": 0.0,
-                    "chat": round(chat_cost_usd, 6),
-                    "total": round(chat_cost_usd, 6),
-                },
+                "cost_usd": tk.cost_usd_dict(direct_total=chat_cost_usd),
             },
         )
         self.logs_dir.mkdir(parents=True, exist_ok=True)

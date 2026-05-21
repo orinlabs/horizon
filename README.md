@@ -73,8 +73,17 @@ harbor run \
   -d orinlabs/horizon-1-public \
   --agent-import-path trace_shell_context.agent:TraceShellContextAgent \
   -m openai/gpt-4o-mini \
-  --ae OPENROUTER_API_KEY=sk-or-...
+  --ae OPENROUTER_API_KEY=sk-or-... \
+  --ae OPENROUTER_MANAGEMENT_KEY=sk-or-...
 ```
+
+> **Reference agents require `OPENROUTER_MANAGEMENT_KEY`.** Every agent under
+> `agents/` (trace_*, hermes, openclaw_lcm) mints a per-trial disposable
+> OpenRouter sub-key with a $20 spend cap for cost isolation, then disposes
+> of it at trial end. Get a management key from OpenRouter dashboard →
+> Settings → Keys → Create Management Key (this is a separate credential
+> from your regular API key). Built-in Harbor agents like `terminus-2` don't
+> need it.
 
 `-d` runs every task in the `[orinlabs/horizon-1-public](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public)` dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
 
@@ -95,6 +104,8 @@ harbor run \
   -n 32 \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
+
+For reference agents on Daytona, also add `--ae OPENROUTER_MANAGEMENT_KEY=sk-or-...`.
 
 ## Submitting an agent
 
@@ -117,6 +128,9 @@ We're collecting community submissions for the public leaderboard. The flow is i
      -m openai/gpt-4o-mini \
      --ae OPENROUTER_API_KEY=sk-or-...
    ```
+
+   If you reuse `agent_utils.trial_subkey` for cost isolation (as all reference
+   agents do), also pass `--ae OPENROUTER_MANAGEMENT_KEY=sk-or-...`.
 
 3. **Open a PR against [`orinlabs/horizon-1`](https://github.com/orinlabs/horizon-1)** with just the new `agents/<your-agent-name>/` directory. Don't modify reference agents, the eval set, or the dataset manifest.
 4. **Email [horizon@orinlabs.ai](mailto:horizon@orinlabs.ai)** with a link to the PR. Include the agent name, the model(s) you've validated against, and any setup notes (extra env vars, model assumptions, etc.). We'll run it on the private set, post results to the leaderboard, and merge the PR.

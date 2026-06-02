@@ -43,6 +43,7 @@ Run it with::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -50,6 +51,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -87,7 +89,18 @@ TOP_K_DEFAULT = 3
 MAX_FORMATTED_EVENT_CHARS = 1_200
 MAX_CHUNK_CHARS = 8_000
 EMBEDDING_BATCH_SIZE = 8
+# Max in-flight embedding requests per case during ingest (bounded queue).
+EMBED_INGEST_CONCURRENCY = 100
 MAX_EXEC_OUTPUT_CHARS = 12_000
+# On-disk cache for ingest embeddings. The embedding matrix for a trace is a
+# pure function of (chunk texts, embedding model) — the chat model is
+# irrelevant — so sweeping many chat models over the same task should embed
+# each trace exactly once. We key the cache on a hash of the chunk texts +
+# embedding model so a cache hit is byte-for-byte the same input. Bump
+# EMBED_CACHE_VERSION whenever chunking/formatting changes in a way that would
+# invalidate previously-cached matrices.
+EMBED_CACHE_VERSION = "v1"
+DEFAULT_EMBED_CACHE_DIR = Path(".cache") / "trace_rag_embeddings"
 
 SYSTEM_PROMPT_TEMPLATE = (
     "You are an autonomous agent.\n\n"
@@ -98,6 +111,12 @@ SYSTEM_PROMPT_TEMPLATE = (
     "  - Task tools: {tool_names}. Each one matches the shell command of the "
     "same name in the prior trace; use them to act on the current world. "
     "There is no generic shell escape hatch.\n\n"
+    "Workflow: ALWAYS start by inspecting the current environment (call task "
+    "tools like `task_list`, `sms_list`, `show_account` etc. to see what's "
+    "pending). The task is to act on the present situation — `trace_search` "
+    "is for INFORMING that action with prior-session memory, not a destination "
+    "in itself. Don't summarize the trace or ask the user what to do; find the "
+    "pending work in the environment and complete it.\n\n"
     "Complete the task and stop when its success condition is met."
 )
 
@@ -323,6 +342,7 @@ class TraceRagAgent(BaseAgent):
         ingest_embedding_cost_usd = 0.0
         query_embedding_cost_usd = 0.0
         total_embedding_tokens = 0
+        embeddings_cached = False
         t_ingest_done = t_start
         t_end = t_start
 
@@ -351,26 +371,65 @@ class TraceRagAgent(BaseAgent):
             lines = trace_text.splitlines()
             chunks = _chunk_trace_by_day(lines)
 
-            if chunks:
-                embeddings: list[list[float]] = []
-                for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+            chunk_ids = [c.id for c in chunks]
+            cache_key = _embed_cache_key(chunks, EMBEDDING_MODEL) if chunks else ""
+            cached_matrix = (
+                _load_embed_cache(cache_key, chunk_ids) if chunks else None
+            )
+
+            if cached_matrix is not None:
+                # Cache hit: the trace was already embedded by a previous run
+                # (e.g. a different chat model over the same task). Skip the
+                # embedding round-trips entirely — no tokens, no cost.
+                matrix = cached_matrix
+                embeddings_cached = True
+            elif chunks:
+                # Embed batches concurrently via a bounded queue (up to
+                # EMBED_INGEST_CONCURRENCY in-flight requests) instead of
+                # serially — large traces are thousands of chunks, so serial
+                # round-trips dominate wall-clock. Each batch is retried on
+                # transient failures; order is preserved so embeddings stay
+                # aligned with their chunks.
+                batch_starts = list(range(0, len(chunks), EMBEDDING_BATCH_SIZE))
+                sem = asyncio.Semaphore(EMBED_INGEST_CONCURRENCY)
+
+                async def _embed_one(start: int):
                     batch = chunks[start : start + EMBEDDING_BATCH_SIZE]
-                    batch_idx = start // EMBEDDING_BATCH_SIZE
-                    async with timed_call(
-                        call_log,
-                        "embedding",
-                        f"ingest batch {batch_idx} ({len(batch)} chunks)",
-                    ):
-                        batch_embeddings, batch_tokens, batch_cost = (
-                            await _create_embeddings_resilient(
-                                client, [c.text for c in batch]
-                            )
-                        )
+                    texts = [c.text for c in batch]
+                    last_exc: Exception | None = None
+                    async with sem:
+                        for attempt in range(5):
+                            try:
+                                async with timed_call(
+                                    call_log,
+                                    "embedding",
+                                    f"ingest batch @{start} ({len(batch)} chunks)",
+                                ):
+                                    return await _create_embeddings_resilient(client, texts)
+                            except Exception as exc:  # transient: 429/5xx/socket
+                                last_exc = exc
+                                await asyncio.sleep(min(2 ** attempt, 16))
+                    raise last_exc if last_exc else RuntimeError("embed failed")
+
+                batch_results = await asyncio.gather(
+                    *(_embed_one(s) for s in batch_starts)
+                )
+                embeddings: list[list[float]] = []
+                for batch_embeddings, batch_tokens, batch_cost in batch_results:
                     total_embedding_tokens += batch_tokens
                     ingest_embedding_cost_usd += batch_cost
                     embeddings.extend(batch_embeddings)
+                if len(embeddings) != len(chunks):
+                    raise RuntimeError(
+                        "embedding count mismatch: embedded "
+                        f"{len(embeddings)} of {len(chunks)} chunks — refusing "
+                        "to run with a partially-embedded trace"
+                    )
                 matrix = np.array(embeddings, dtype=np.float32)
                 matrix /= np.linalg.norm(matrix, axis=1, keepdims=True).clip(min=1e-8)
+                # Persist the normalized matrix so the next chat model over
+                # this same trace is a cache hit.
+                _store_embed_cache(cache_key, matrix, chunk_ids)
             else:
                 matrix = np.zeros((0, 1), dtype=np.float32)
 
@@ -383,10 +442,15 @@ class TraceRagAgent(BaseAgent):
                     environment, f"rm -f {TRACE_PATH}", timeout_sec=10
                 )
 
+            embed_note = (
+                f"Loaded cached embeddings ({EMBEDDING_MODEL}, 0 new tokens)"
+                if embeddings_cached
+                else f"Embedded with {EMBEDDING_MODEL} ({total_embedding_tokens} tokens)"
+            )
             ingest_note = (
                 f"Ingested {len(chunks)} chunks from {TRACE_PATH}: "
                 f"{_summarize_chunk_ids(chunks)}. "
-                f"Embedded with {EMBEDDING_MODEL} ({total_embedding_tokens} tokens). "
+                f"{embed_note}. "
                 f"Trace file deleted to force retrieval through `trace_search`."
             )
             self.logger.info(ingest_note)
@@ -577,6 +641,7 @@ class TraceRagAgent(BaseAgent):
                 "tools": tool_names,
                 "embedding_model": EMBEDDING_MODEL,
                 "embedding_tokens": total_embedding_tokens,
+                "embeddings_cached": embeddings_cached,
                 "timing_seconds": {
                     "ingest": round(t_ingest_done - t_start, 3),
                     "chat": round(t_end - t_ingest_done, 3),
@@ -630,6 +695,81 @@ class TraceRagAgent(BaseAgent):
             for i in top_idx
         ]
         return {"hits": hits}, embed_tokens, embed_cost
+
+
+def _embed_cache_dir() -> Path:
+    """Directory holding cached ingest-embedding matrices.
+
+    Overridable via ``TRACE_RAG_EMBED_CACHE_DIR`` so multiple machines / runs
+    can point at a shared location; defaults to the repo-local ``.cache/``
+    convention (gitignored).
+    """
+    override = os.environ.get("TRACE_RAG_EMBED_CACHE_DIR")
+    return Path(override) if override else DEFAULT_EMBED_CACHE_DIR
+
+
+def _embed_cache_key(chunks: list[Chunk], model: str) -> str:
+    """Stable hash over (cache version, embedding model, every chunk id+text).
+
+    Hashing the rendered chunk texts means the key implicitly captures the
+    chunking params (``MAX_CHUNK_CHARS``), event formatting/truncation, and
+    the trace content itself — anything that would change an embedding input
+    changes the key.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(EMBED_CACHE_VERSION.encode())
+    hasher.update(b"\x00")
+    hasher.update(model.encode())
+    for chunk in chunks:
+        hasher.update(b"\x00")
+        hasher.update(chunk.id.encode())
+        hasher.update(b"\x01")
+        hasher.update(chunk.text.encode())
+    return hasher.hexdigest()
+
+
+def _load_embed_cache(key: str, expected_ids: list[str]) -> np.ndarray | None:
+    """Return the cached L2-normalized matrix for ``key``, or ``None`` on miss.
+
+    Any failure (missing file, partial/corrupt npz, id mismatch) is treated as
+    a miss — caching must never be able to fail or poison a run.
+    """
+    path = _embed_cache_dir() / f"{key}.npz"
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            matrix = data["matrix"]
+            cached_ids = [str(i) for i in data["chunk_ids"]]
+    except Exception:
+        return None
+    if cached_ids != expected_ids or matrix.shape[0] != len(expected_ids):
+        return None
+    return np.ascontiguousarray(matrix, dtype=np.float32)
+
+
+def _store_embed_cache(key: str, matrix: np.ndarray, chunk_ids: list[str]) -> None:
+    """Atomically persist ``matrix`` under ``key`` (best-effort).
+
+    Writes to a unique temp file then ``os.replace`` so concurrent trials
+    embedding the same trace can't observe a half-written file. Swallows all
+    errors — a failed cache write just means the next run re-embeds.
+    """
+    cache_dir = _embed_cache_dir()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache_dir / f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp.npz"
+        np.savez(
+            tmp,
+            matrix=np.ascontiguousarray(matrix, dtype=np.float32),
+            chunk_ids=np.array(chunk_ids),
+        )
+        os.replace(tmp, cache_dir / f"{key}.npz")
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
 
 
 async def _create_embeddings_resilient(

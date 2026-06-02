@@ -70,7 +70,11 @@ SEED_SESSION_PREFIX = "horizon-seed"
 # `npm:` prefix bypasses openclaw's clawhub registry resolution (which
 # was hitting ECONNRESET in our Daytona sandboxes) and goes straight to
 # npm. Functionally identical install path.
-LCM_PACKAGE = "npm:@martian-engineering/lossless-claw"
+# lossless-claw 0.11.x requires OpenClaw >= 2026.5.12 (per lossless-claw
+# CHANGELOG). Trying latest-of-both: openclaw 2026.5.20 + lossless-claw 0.11.2
+# (see install command for openclaw pin). The 0.11.x line uses the new
+# allowModelOverride + allowedModels gate on the lossless-claw plugin entry.
+LCM_PACKAGE = "npm:@martian-engineering/lossless-claw@0.11.2"
 
 # Path inside the container where we drop the trace converter after
 # uploading it from the host. /tmp survives between exec calls but not
@@ -84,10 +88,11 @@ CONVERTER_SCRIPT_REMOTE = "/tmp/openclaw_convert_trace.mjs"
 # session keys come back as `agent:main:explicit:<sid>`.
 LCM_AGENT_NAME = "main"
 
-# Go release tarball to fetch when building lcm-tui from source. Pinned
-# because lossless-claw/tui requires Go >=1.24 (per /tmp/lossless-claw/
-# tui/README.md), and Debian 13's golang-go is 1.21.x.
-GO_VERSION = "1.24.0"
+# Go release tarball to fetch when building lcm-tui from source.
+# lossless-claw/tui's go.mod requires Go >=1.24.5. Pin to 1.25.10 so Go's
+# toolchain feature doesn't auto-download a SECOND Go toolchain on top of
+# the first one (which would blow the sandbox's 4GB storage cap).
+GO_VERSION = "1.25.10"
 GO_TARBALL_URL = (
     f"https://go.dev/dl/go{GO_VERSION}.linux-amd64.tar.gz"
 )
@@ -203,7 +208,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             # acceptance regression.
             await self.exec_as_root(
                 environment,
-                "npm install -g openclaw@2026.4.29 better-sqlite3",
+                "npm install -g openclaw@2026.5.20 better-sqlite3",
                 timeout_sec=600,
             )
 
@@ -292,6 +297,22 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             "c.plugins.entries = c.plugins.entries || {};"
             "c.plugins.entries['lossless-claw'] = c.plugins.entries['lossless-claw'] || {};"
             "c.plugins.entries['lossless-claw'].enabled = true;"
+            # lossless-claw 0.11.x requires explicit allowModelOverride gates
+            # on `llm` (for summaryModel) and `subagent` (for expansionModel)
+            # blocks. Without these, the plugin refuses to start with
+            # "Invalid config".
+            "c.plugins.entries['lossless-claw'].llm = Object.assign("
+            "  {}, c.plugins.entries['lossless-claw'].llm || {},"
+            "  {"
+            "    allowModelOverride: true,"
+            f"    allowedModels: ['openrouter/{DEFAULT_SUMMARY_MODEL}']"
+            "  });"
+            "c.plugins.entries['lossless-claw'].subagent = Object.assign("
+            "  {}, c.plugins.entries['lossless-claw'].subagent || {},"
+            "  {"
+            "    allowModelOverride: true,"
+            f"    allowedModels: ['openrouter/{DEFAULT_EXPANSION_MODEL}']"
+            "  });"
             "c.plugins.entries['lossless-claw'].config = Object.assign("
             "  {}, c.plugins.entries['lossless-claw'].config || {},"
             "  {"
@@ -342,7 +363,7 @@ class OpenClawLcmAgent(BaseInstalledAgent):
             await self.exec_as_root(
                 environment,
                 (
-                    "PATH=/usr/local/go/bin:$PATH "
+                    "PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local "
                     "go install github.com/Martian-Engineering/lossless-claw/tui@latest "
                     "&& mv /root/go/bin/tui /usr/local/bin/lcm-tui"
                 ),

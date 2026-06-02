@@ -7,9 +7,12 @@ events) and ``trace_keyword`` (BM25 over the same chunks), mem0 owns the
 extraction → storage → retrieval pipeline end-to-end and represents a
 "production memory framework" baseline for the matrix.
 
-Ingestion is bounded to ``MEM0_MAX_EVENTS`` (default 500) of the most
-recent trace events because mem0 calls the LLM for each ingestion batch
-and ingesting all 27k events on a long trace would dominate cost.
+Ingests the FULL trace, chunked by wake-sleep cycle. A cycle starts at a
+"You are being woken up from sleep" message and ends at the next sleep()
+function_call. Each cycle becomes one mem0 input message (compact narrative
+of all events in that cycle), so mem0 extracts facts from coherent session
+chunks rather than individual JSONL lines. A 35k-event trace ≈ 700 cycles
+which fits comfortably in the 30-min agent timeout.
 
 Storage is ephemeral ChromaDB on /tmp (recreated per trial run).
 
@@ -56,8 +59,12 @@ DEFAULT_EXTRACTION_MODEL = "openai/gpt-4o-mini"
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 ATIF_VERSION = "ATIF-v1.4"
 MEM0_USER_ID = "horizon-trace"
-MEM0_MAX_EVENTS = 500
-MEM0_BATCH_SIZE = 20
+MEM0_BATCH_SIZE = 2          # cycles per mem0.add() call; >2 hits the 8191-token
+                             # embedding limit on text-embedding-3-small (mem0
+                             # embeds the concatenated batch as a search query)
+MEM0_INGEST_CONCURRENCY = 4  # parallel mem0.add() calls; chromadb serializes
+                             # writes internally so higher values yield diminishing
+                             # returns and may starve other I/O
 TOP_K_DEFAULT = 5
 MAX_FORMATTED_EVENT_CHARS = 800
 MAX_EXEC_OUTPUT_CHARS = 12_000
@@ -73,6 +80,13 @@ SYSTEM_PROMPT = (
     "is installed as a shell command of the same name in `/usr/local/bin` "
     "with matching `--flag value` arguments). Use this to act on the current "
     "world.\n\n"
+    "Workflow: ALWAYS start with `shell_exec` to inspect the current environment "
+    "(e.g. `task_list`, `sms_list`, `show_account` — names match the trace's "
+    "function_call events). The task is to act on the present situation — "
+    "`memory_search` is for INFORMING that action with prior-session memory, "
+    "not a destination in itself. Don't query memory repeatedly with rephrased "
+    "versions of 'what should I do'; find the pending work in the environment "
+    "and complete it.\n\n"
     "Complete the task and stop when its success condition is met."
 )
 
@@ -184,6 +198,63 @@ def _format_event(line: str) -> str:
     return f"[{ts}] {role}: {(str(content or ''))[:MAX_FORMATTED_EVENT_CHARS]}"
 
 
+def _is_wake(obj: dict[str, Any]) -> bool:
+    """A 'wake' marker = a system/user message containing the standard wake phrase."""
+    md = obj.get("message_data") or {}
+    if md.get("type") in ("function_call", "function_call_output"):
+        return False
+    content = md.get("content")
+    if isinstance(content, list):
+        content = " ".join(
+            str(p.get("text") or p.get("content") or "") for p in content
+            if isinstance(p, dict)
+        )
+    return "being woken up from sleep" in str(content or "").lower()
+
+
+def _is_sleep(obj: dict[str, Any]) -> bool:
+    md = obj.get("message_data") or {}
+    return md.get("type") == "function_call" and md.get("name") == "sleep"
+
+
+def _chunk_by_wake_cycle(all_lines: list[str]) -> list[list[str]]:
+    """Group JSONL event lines into wake-sleep cycles.
+
+    A cycle starts at a wake message and ends at the next sleep() call.
+    Events before the first wake are emitted as a "preamble" cycle so we
+    don't drop trace prelude. Events after the final sleep without a
+    subsequent wake are emitted as a "tail" cycle. mem0 ingests each cycle
+    as a coherent narrative (one extract-facts pass per cycle), instead of
+    treating every JSONL line as its own message.
+    """
+    cycles: list[list[str]] = []
+    current: list[str] = []
+    seen_first_wake = False
+    for line in all_lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            current.append(line)
+            continue
+        if _is_wake(obj):
+            if current:
+                cycles.append(current)
+            current = [line]
+            seen_first_wake = True
+        elif _is_sleep(obj):
+            current.append(line)
+            cycles.append(current)
+            current = []
+        else:
+            current.append(line)
+    if current:
+        cycles.append(current)
+    # Drop trivial cycles: empties (back-to-back boundaries) and singletons
+    # that are usually just the empty function_call_output of a sleep() call
+    # — no facts there for mem0 to extract.
+    return [c for c in cycles if len(c) >= 2]
+
+
 def _build_mem0(chroma_path: str, api_key: str) -> Any:
     """Construct a mem0 Memory pointed at OpenRouter for LLM/embeddings."""
     from mem0 import Memory
@@ -276,7 +347,15 @@ class TraceMem0Agent(BaseAgent):
             # stdout cap — production traces can be tens of MB.
             trace_text = await read_trace_file(environment, TRACE_PATH)
             all_lines = trace_text.splitlines() if trace_text else []
-            recent = all_lines[-MEM0_MAX_EVENTS:]
+
+            # Group by wake-sleep cycle so mem0 extracts facts from coherent
+            # narratives instead of from individual JSONL lines.
+            cycles = _chunk_by_wake_cycle(all_lines)
+            # Render each cycle to one compact message (joined formatted events).
+            cycle_messages = [
+                "\n".join(_format_event(line) for line in cycle) for cycle in cycles
+            ]
+            recent = cycle_messages  # kept variable name for trajectory logging
 
             # Best-effort delete to force the model through memory_search.
             await _exec_with_retries(environment, f"rm -f {TRACE_PATH}", timeout_sec=10)
@@ -286,26 +365,39 @@ class TraceMem0Agent(BaseAgent):
                 memory = _build_mem0(chroma_path, tk.key)
 
                 ingest_started = time.monotonic()
-                for i in range(0, len(recent), MEM0_BATCH_SIZE):
-                    batch = recent[i : i + MEM0_BATCH_SIZE]
-                    msgs = [
-                        {"role": "user", "content": _format_event(line)} for line in batch
-                    ]
-                    try:
-                        result = await asyncio.to_thread(
-                            memory.add, msgs, user_id=MEM0_USER_ID
-                        )
-                    except Exception as exc:
-                        self.logger.warning(
-                            "mem0 add batch %d failed: %s: %s",
-                            n_batches,
-                            type(exc).__name__,
-                            exc,
-                        )
-                        continue
-                    n_batches += 1
+                # Parallel ingest: at any time, MEM0_INGEST_CONCURRENCY mem0.add
+                # calls are in-flight. ChromaDB serializes writes internally so
+                # we cap concurrency to avoid head-of-line blocking other I/O.
+                sem = asyncio.Semaphore(MEM0_INGEST_CONCURRENCY)
+                batches = [
+                    recent[i : i + MEM0_BATCH_SIZE]
+                    for i in range(0, len(recent), MEM0_BATCH_SIZE)
+                ]
+
+                async def _ingest_batch(batch_idx: int, batch: list[str]) -> int:
+                    msgs = [{"role": "user", "content": c} for c in batch]
+                    async with sem:
+                        try:
+                            result = await asyncio.to_thread(
+                                memory.add, msgs, user_id=MEM0_USER_ID
+                            )
+                        except Exception as exc:
+                            self.logger.warning(
+                                "mem0 add batch %d failed: %s: %s",
+                                batch_idx,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            return 0
                     if isinstance(result, dict):
-                        n_added += len(result.get("results") or [])
+                        return len(result.get("results") or [])
+                    return 0
+
+                ingest_results = await asyncio.gather(
+                    *[_ingest_batch(i, b) for i, b in enumerate(batches)]
+                )
+                n_batches = len(batches)
+                n_added = sum(ingest_results)
                 ingest_seconds = time.monotonic() - ingest_started
                 self.logger.info(
                     "mem0 ingest: %d events -> %d batches -> %d memories in %.1fs",

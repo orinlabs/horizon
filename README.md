@@ -9,6 +9,8 @@
 
 A learning benchmark for extremely long-horizon agents, packaged as [Harbor](https://www.harborframework.com/) tasks and agents.
 
+**Read the research post:** [Introducing Horizon](https://www.orinlabs.ai/research/horizon)
+
 ## Purpose
 
 As agents get more autonomous, their ability to learn on the job has become a critical bottleneck for usefulness. Existing memory benchmarks ([LoCoMo](https://arxiv.org/abs/2402.17753), [LongMemEval](https://arxiv.org/abs/2410.10813)) measure reactive chatbot applications, not autonomous agents. Existing learning benchmarks like [ARC-AGI](https://arcprize.org/) measure acquisition and application of skills, but use sandboxed environments that are not representative of complex work.
@@ -76,7 +78,7 @@ harbor run \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
-`-d` runs every task in the `[orinlabs/horizon-1-public](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public)` dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
+`-d` runs every task in the [orinlabs/horizon-1-public](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public) dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
 
 Reference agents live under `agents/`. Any [Harbor built-in agent](https://www.harborframework.com/docs/agents) works with `-a <name>`. Results land in `jobs/<job-name>/` — browse them with `harbor view jobs`.
 

@@ -8,9 +8,18 @@ logs/
 .env.*
 !.env.example
 
-# Eval trace data is hydrated from Hugging Face.
-# Pull with: uv run --with huggingface_hub python scripts/fetch_eval_data.py
+# Eval trace data is hydrated from Hugging Face at runtime.
 evals/*/environment/workdir/trace.jsonl
 evals/*/data/*.raw.jsonl
-terminals/
+
+# Build artifacts
 dist/
+
+# Agent embedding and memory caches
+.cache/
+
+# Editor/OS artifacts
+terminals/
+.DS_Store
+*.swp
+*.swo

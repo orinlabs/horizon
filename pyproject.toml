@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["agents/trace_shell_context"]
+packages = ["agents"]
 
 [tool.hatch.build.targets.wheel.sources]
 "agents" = ""

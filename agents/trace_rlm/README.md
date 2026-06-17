@@ -4,8 +4,6 @@ Recursive Language Model (RLM) baseline over `/workdir/trace.jsonl`, following [
 
 Instead of stuffing the (2–36M token) trace into the model's context window, the trace is loaded as a **variable in a persistent Python REPL**. A *root* LM sees only the task + the trace's size, and writes code to peek, grep, partition, and launch **recursive depth-1 sub-LM calls** over slices of the trace. No single LM call holds the whole trace, which sidesteps "context rot" and scales past the context window.
 
-It's the recursive cousin of `trace_shell_context` (greps the raw trace but no recursion, whole file in context) and `trace_window` (recent slice only): RLM keeps the trace out of the root context entirely and lets the model decide how to decompose it at test time.
-
 ## Tools (root LM)
 
 - `repl_exec(code)` — run Python in a persistent notebook pre-loaded with:

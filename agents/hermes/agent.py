@@ -675,10 +675,9 @@ class HermesAgent(BaseInstalledAgent):
         # time) and (b) the environment-owned tool CLI at
         # /tools/horizon-tools. Without this, hermes's autonomous mode
         # tends to give up after `ls /root/` and never discovers either
-        # surface — making it unfair vs API agents like trace_mem0 whose
-        # tool registry is passed natively as LLM function schemas.
-        # This mirrors the spirit of trace_mem0's system prompt: tells
-        # the agent what's available, not what to do.
+        # surface — making it unfair vs API agents whose tool registry is
+        # passed natively as LLM function schemas. This tells the agent
+        # what's available, not what to do.
         framed_instruction = (
             "You have two key capabilities for this task:\n"
             "  1. `session_search` (your built-in tool): prior-session "

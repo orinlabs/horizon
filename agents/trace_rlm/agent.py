@@ -13,10 +13,6 @@ REPL (and the trace's size), and writes code to ``peek``, ``grep``,
 ``llm(prompt)``. No single LM call ever has to hold the whole trace, which
 sidesteps "context rot" and scales past the context window.
 
-This is the recursive cousin of two existing baselines:
-  - ``trace_shell_context`` greps the raw trace with shell but has no
-    recursion and stuffs the whole file into context.
-  - ``trace_window`` keeps only a recent slice.
 RLM keeps the trace out of the root context entirely and lets the model
 decide, at test time, how to decompose it.
 

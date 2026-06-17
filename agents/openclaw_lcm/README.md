@@ -4,7 +4,7 @@ A Harbor wrapper around [openclaw](https://github.com/openclaw/openclaw) + the [
 
 ## What it demonstrates
 
-A "memory framework" baseline for long-horizon recall. Unlike `trace_mem0` (vector store + LLM-extracted facts) or `trace_keyword` (BM25 over raw chunks), openclaw_lcm exercises lossless-claw's **summary DAG**:
+A "memory framework" baseline for long-horizon recall. openclaw_lcm exercises lossless-claw's **summary DAG**:
 
 1. `convert_trace.mjs` groups `/workdir/trace.jsonl` into per-day session files at `~/.openclaw/agents/main/sessions/<day>.jsonl`.
 2. `lcm-tui backfill main <day> --apply` imports each day's messages AND runs leaf+condensed compaction with the configured summary model (`gpt-5-mini` by default). Each backfill produces ~5-15 LLM summarization calls, building the DAG.

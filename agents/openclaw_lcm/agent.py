@@ -1,8 +1,7 @@
 """OpenClawLcmAgent — Harbor wrapper around openclaw + lossless-claw.
 
-Active-ingestion baseline alongside trace_mem0 and hermes:
+Active-ingestion baseline alongside hermes:
 
-  - mem0  : owns extraction → vector store → semantic recall
   - hermes: agent's own MEMORY.md/USER.md (passive), SessionDB seeded raw
   - openclaw: lossless-claw plugin persists every message, builds a DAG of
               summaries, and exposes lcm_grep / lcm_describe / lcm_expand

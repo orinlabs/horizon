@@ -56,7 +56,7 @@ cd horizon-1
 uv tool install harbor --with-editable .
 ```
 
-`--with-editable .` installs this repo's reference agents (e.g. `trace_shell_context`) alongside Harbor so they can be referenced by import path.
+`--with-editable .` installs this repo's reference agents (e.g. `trace_rag`) alongside Harbor so they can be referenced by import path.
 
 ## Running the benchmark
 
@@ -73,14 +73,14 @@ harbor run \
 # reference an agent shipped in this repo
 harbor run \
   -d orinlabs/horizon-1-public \
-  --agent-import-path trace_shell_context.agent:TraceShellContextAgent \
+  --agent-import-path trace_rag.agent:TraceRagAgent \
   -m openai/gpt-4o-mini \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
 `-d` runs every task in the [orinlabs/horizon-1-public](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public) dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
 
-Reference agents live under `agents/`. Any [Harbor built-in agent](https://www.harborframework.com/docs/agents) works with `-a <name>`. Results land in `jobs/<job-name>/` — browse them with `harbor view jobs`.
+Reference agents live under `agents/` — see [agents/README.md](./agents/README.md) for each harness. Any [Harbor built-in agent](https://www.harborframework.com/docs/agents) works with `-a <name>`. Results land in `jobs/<job-name>/` — browse them with `harbor view jobs`.
 
 ## Running on Daytona
 
@@ -102,7 +102,7 @@ harbor run \
 
 We're collecting community submissions for the public leaderboard. The flow is intentionally lightweight — open a PR, then email us.
 
-1. **Drop your agent under `agents/<your-agent-name>/`**, mirroring the layout of an existing reference agent like [`agents/trace_window/`](./agents/trace_window/) or [`agents/trace_shell_context/`](./agents/trace_shell_context/):
+1. **Drop your agent under `agents/<your-agent-name>/`**, mirroring the layout of an existing reference agent like [`agents/trace_rag/`](./agents/trace_rag/) or [`agents/hermes/`](./agents/hermes/):
 
    ```
    agents/<your-agent-name>/

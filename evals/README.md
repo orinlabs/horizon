@@ -1,6 +1,6 @@
-# Horizon-1 Public Evaluation Tasks
+# Horizon Public Evaluation Tasks
 
-This directory contains the public example tasks from the Horizon-1 benchmark. The full benchmark is private to prevent overfitting.
+This directory contains the public example tasks from the Horizon benchmark. The full benchmark is private to prevent overfitting.
 
 ## Task Structure
 
@@ -63,7 +63,7 @@ Run the full public dataset:
 
 ```bash
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   -a terminus-2 \
   -m openrouter/openai/gpt-4o-mini \
   --ae OPENROUTER_API_KEY=sk-or-...
@@ -71,7 +71,7 @@ harbor run \
 
 ## Traces
 
-Traces are hosted on HuggingFace at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces) and downloaded into the container at `/workdir/trace.jsonl` during image build.
+Traces are hosted on HuggingFace at [orinlabs/horizon-example-traces](https://huggingface.co/datasets/orinlabs/horizon-example-traces) and downloaded into the container at `/workdir/trace.jsonl` during image build.
 
 Each trace is a JSONL file where each line is a JSON object with:
 - `timestamp`: ISO-8601 timestamp

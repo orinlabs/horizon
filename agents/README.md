@@ -1,4 +1,4 @@
-# Horizon-1 agents
+# Horizon agents
 
 Horizon measures whether an agent can **learn from a long prior-session trace** and apply that knowledge in a live task environment. Agents fall into three groups:
 
@@ -22,7 +22,7 @@ Anthropic's CLI coding agent. Harbor installs `claude` in the container and invo
 export ANTHROPIC_API_KEY=sk-ant-...
 
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   -a claude-code \
   -m anthropic/claude-opus-4.8 \
   --ak prompt_template_path=agents/claude_code_horizon_prompt.j2
@@ -40,7 +40,7 @@ OpenAI's Codex CLI agent. Harbor installs `codex` and runs it against the task i
 export OPENAI_API_KEY=sk-...
 
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   -a codex \
   -m openai/gpt-5-codex \
   --ak reasoning_effort=high
@@ -50,7 +50,7 @@ Codex resolves auth from `OPENAI_API_KEY` by default, or from a local `~/.codex/
 
 ## Reference agents (this directory)
 
-These ship with the `horizon-1-agents` package (`uv tool install harbor --with-editable .`). Run them with `--agent-import-path <module>.agent:<Class>`.
+These ship with the `horizon-agents` package (`uv tool install harbor --with-editable .`). Run them with `--agent-import-path <module>.agent:<Class>`.
 
 | Directory | Harness name | Trace strategy | How it acts on the task |
 |---|---|---|---|
@@ -112,7 +112,7 @@ harbor run -p evals/01-example-catering-vendor \
   -m openai/gpt-5-codex
 
 # Reference agent (RAG)
-harbor run -d orinlabs/horizon-1-public \
+harbor run -d orinlabs/horizon-public \
   --agent-import-path trace_rag.agent:TraceRagAgent \
   -m openai/gpt-4o-mini \
   --ae OPENROUTER_API_KEY=sk-or-...

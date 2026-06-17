@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="Horizon-1 Environment Base"
-LABEL org.opencontainers.image.description="Public base image for Horizon-1 eval environments."
-LABEL org.opencontainers.image.source="https://github.com/orinlabs/horizon-1"
+LABEL org.opencontainers.image.title="Horizon Environment Base"
+LABEL org.opencontainers.image.description="Public base image for Horizon eval environments."
+LABEL org.opencontainers.image.source="https://github.com/orinlabs/horizon"
 LABEL org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \

@@ -1,10 +1,10 @@
-# Dataset manifest for orinlabs/horizon-1-public
+# Dataset manifest for orinlabs/horizon-public
 # Add tasks using: harbor add <org>/<name>
 # Publish using: harbor publish
 
 [dataset]
-name = "orinlabs/horizon-1-public"
-description = "Horizon-1 sample set: continual-learning eval tasks"
+name = "orinlabs/horizon-public"
+description = "Horizon sample set: continual-learning eval tasks"
 authors = []
 keywords = []
 

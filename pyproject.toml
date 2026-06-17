@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "horizon-1-agents"
+name = "horizon-agents"
 version = "0.1.0"
-description = "Horizon-1 reference agents for use with the Harbor benchmark."
+description = "Horizon reference agents for use with the Harbor benchmark."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

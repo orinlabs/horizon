@@ -31,7 +31,7 @@ Full benchmark dataset:
 
 ```bash
 harbor run \
-    -d orinlabs/horizon-1-public \
+    -d orinlabs/horizon-public \
     --agent-import-path openclaw_lcm.agent:OpenClawLcmAgent \
     -m anthropic/claude-opus-4.7 \
     --agent-setup-timeout-multiplier 4 \

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 DEFAULT_DATASET_BASE_URL = (
-    "https://huggingface.co/datasets/orinlabs/horizon-1-example-traces/resolve/main"
+    "https://huggingface.co/datasets/orinlabs/horizon-example-traces/resolve/main"
 )
 
 

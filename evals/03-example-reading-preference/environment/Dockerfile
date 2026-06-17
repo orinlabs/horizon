@@ -1,4 +1,4 @@
-FROM ghcr.io/orinlabs/horizon-1-environment:latest
+FROM ghcr.io/orinlabs/horizon-environment:latest
 
 ARG HORIZON_EVAL_SLUG=03-example-reading-preference
 

@@ -36,7 +36,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/orinlabs/horizon-1-environment
+          images: ghcr.io/orinlabs/horizon-environment
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long

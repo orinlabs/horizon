@@ -1,10 +1,10 @@
-# Horizon-1
+# Horizon
 
-![Horizon-1](docs/benchmark.png)
+![Horizon](docs/benchmark.png)
 
-[![Stars](https://img.shields.io/github/stars/orinlabs/horizon-1?style=flat&logo=github&cacheSeconds=300)](https://github.com/orinlabs/horizon-1/stargazers)
-[![Last commit](https://img.shields.io/github/last-commit/orinlabs/horizon-1?cacheSeconds=300)](https://github.com/orinlabs/horizon-1/commits/main)
-[![License](https://img.shields.io/github/license/orinlabs/horizon-1?cacheSeconds=300)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/orinlabs/horizon?style=flat&logo=github&cacheSeconds=300)](https://github.com/orinlabs/horizon/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/orinlabs/horizon?cacheSeconds=300)](https://github.com/orinlabs/horizon/commits/main)
+[![License](https://img.shields.io/github/license/orinlabs/horizon?cacheSeconds=300)](./LICENSE)
 [![Harbor](https://img.shields.io/badge/harness-harbor-blue)](https://www.harborframework.com/)
 
 A learning benchmark for extremely long-horizon agents, packaged as [Harbor](https://www.harborframework.com/) tasks and agents.
@@ -15,15 +15,15 @@ A learning benchmark for extremely long-horizon agents, packaged as [Harbor](htt
 
 As agents get more autonomous, their ability to learn on the job has become a critical bottleneck for usefulness. Existing memory benchmarks ([LoCoMo](https://arxiv.org/abs/2402.17753), [LongMemEval](https://arxiv.org/abs/2410.10813)) measure reactive chatbot applications, not autonomous agents. Existing learning benchmarks like [ARC-AGI](https://arcprize.org/) measure acquisition and application of skills, but use sandboxed environments that are not representative of complex work.
 
-Horizon-1 measures whether an agent can acquire learnings from a long first-person history (see task example below) and apply them later in an environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
+Horizon measures whether an agent can acquire learnings from a long first-person history (see task example below) and apply them later in an environment. It makes no distinction between models and harnesses: the target is the utility of the learning system, regardless of how it is crafted.
 
 ## Structure
 
-The bulk of Horizon-1 is private to prevent overfitting. We have included a few example eval cases in this public repo, including a public [HuggingFace dataset](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces) of traces, to show how the benchmark is structured.
+The bulk of Horizon is private to prevent overfitting. We have included a few example eval cases in this public repo, including a public [HuggingFace dataset](https://huggingface.co/datasets/orinlabs/horizon-example-traces) of traces, to show how the benchmark is structured.
 
 Each trace is downloaded into the environment image at `/workdir/trace.jsonl` at build time. The agent is given a chance to ingest this trace however it wants before the task starts. Then, the task starts and the agent must use the trace (or any derived representations of it) to complete the task.
 
-The average trace in the private set is ~30M tokens of data; the public examples are much smaller. Browse the full public set at [orinlabs/horizon-1-example-traces](https://huggingface.co/datasets/orinlabs/horizon-1-example-traces).
+The average trace in the private set is ~30M tokens of data; the public examples are much smaller. Browse the full public set at [orinlabs/horizon-example-traces](https://huggingface.co/datasets/orinlabs/horizon-example-traces).
 
 The agent is then evaluated on accuracy, speed, and cost.
 
@@ -51,8 +51,8 @@ The agent is expected to remember that `curl` is broken and use wget first this 
 Requires [Docker](https://docs.docker.com/get-docker/) and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/orinlabs/horizon-1.git
-cd horizon-1
+git clone https://github.com/orinlabs/horizon.git
+cd horizon
 uv tool install harbor --with-editable .
 ```
 
@@ -65,20 +65,20 @@ Get an [OpenRouter](https://openrouter.ai/keys) API key, then run the full datas
 ```bash
 # built-in Harbor agent (e.g. terminus-2)
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   -a terminus-2 \
   -m openrouter/openai/gpt-4o-mini \
   --ae OPENROUTER_API_KEY=sk-or-...
 
 # reference an agent shipped in this repo
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   --agent-import-path trace_rag.agent:TraceRagAgent \
   -m openai/gpt-4o-mini \
   --ae OPENROUTER_API_KEY=sk-or-...
 ```
 
-`-d` runs every task in the [orinlabs/horizon-1-public](https://hub.harborframework.com/datasets/orinlabs/horizon-1-public) dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
+`-d` runs every task in the [orinlabs/horizon-public](https://hub.harborframework.com/datasets/orinlabs/horizon-public) dataset. To target a single task instead, swap `-d <name>` for `-p evals/<task-dir>`.
 
 Reference agents live under `agents/` — see [agents/README.md](./agents/README.md) for each harness. Any [Harbor built-in agent](https://www.harborframework.com/docs/agents) works with `-a <name>`. Results land in `jobs/<job-name>/` — browse them with `harbor view jobs`.
 
@@ -90,7 +90,7 @@ Trials run on local Docker by default, one at a time. For parallel cloud runs, g
 export DAYTONA_API_KEY=dtn_...
 
 harbor run \
-  -d orinlabs/horizon-1-public \
+  -d orinlabs/horizon-public \
   -a terminus-2 \
   -m openrouter/openai/gpt-4o-mini \
   -e daytona \
@@ -114,13 +114,13 @@ We're collecting community submissions for the public leaderboard. The flow is i
 
    ```bash
    harbor run \
-     -d orinlabs/horizon-1-public \
+     -d orinlabs/horizon-public \
      --agent-import-path <your_agent_name>.agent:<YourAgentClass> \
      -m openai/gpt-4o-mini \
      --ae OPENROUTER_API_KEY=sk-or-...
    ```
 
-3. **Open a PR against [`orinlabs/horizon-1`](https://github.com/orinlabs/horizon-1)** with just the new `agents/<your-agent-name>/` directory. Don't modify reference agents, the eval set, or the dataset manifest.
+3. **Open a PR against [`orinlabs/horizon`](https://github.com/orinlabs/horizon)** with just the new `agents/<your-agent-name>/` directory. Don't modify reference agents, the eval set, or the dataset manifest.
 4. **Email [horizon@orinlabs.ai](mailto:horizon@orinlabs.ai)** with a link to the PR. Include the agent name, the model(s) you've validated against, and any setup notes (extra env vars, model assumptions, etc.). We'll run it on the private set, post results to the leaderboard, and merge the PR.
 
 A few things worth knowing before you write the agent:

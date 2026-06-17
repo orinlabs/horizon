@@ -30,7 +30,7 @@ Full benchmark dataset:
 
 ```bash
 harbor run \
-    -d orinlabs/horizon-1-public \
+    -d orinlabs/horizon-public \
     --agent-import-path hermes.agent:HermesAgent \
     -m anthropic/claude-sonnet-4.6 \
     --agent-setup-timeout-multiplier 3 \

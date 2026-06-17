@@ -1,4 +1,4 @@
-FROM ghcr.io/orinlabs/horizon-1-environment:latest
+FROM ghcr.io/orinlabs/horizon-environment:latest
 
 ARG HORIZON_EVAL_SLUG=02-example-expense-code
 
